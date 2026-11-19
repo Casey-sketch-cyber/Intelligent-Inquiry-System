@@ -60,7 +60,7 @@ def no_stale_ui(response):
     return response
 
 STATUS_CN = {"pending": "未询价", "sent": "已发送", "quoted": "已报价", "no_stock": "无货", "asking": "对方反问",
-             "failed": "失败", "skipped": "跳过", "identity_unverified": "身份待核实（未发送）", "parse_pending": "回复已保存·待解析", "send_uncertain": "发送结果待核实", "waiting_desktop": "等待 QQ 协助（未发送）"}
+             "failed": "失败", "skipped": "跳过", "identity_unverified": "身份待核实（未发送）", "parse_pending": "回复已保存·待解析", "send_uncertain": "发送结果待核实", "waiting_desktop": "等待 QQ 协助（未发送）", "waiting_search": "等待网站搜索（未发送）"}
 TASK_STATUS_CN = {"running": "进行中", "done": "已结束", "stopped": "已停止", "dry-run": "试运行",
                   "needs_review": "已结束·待补收", "failed": "运行异常", "queued": "等待工作机执行", "waiting_verification": "等待网站人工校验"}
 
