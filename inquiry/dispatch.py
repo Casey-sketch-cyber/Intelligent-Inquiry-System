@@ -1,7 +1,7 @@
 """唯一 QQ 执行进程使用的发件箱；任何不确定的发送都不自动重试。"""
 import time
 
-from . import db, qq, workbench
+from . import db, incidents, qq, workbench
 from .identity import SendUncertainError, SupplierIdentityError
 
 
@@ -28,8 +28,13 @@ def record_attempt(sid, kind):
 def recover_interrupted():
     """只能在拿到 runner.lock 后调用。"""
     with db.connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        interrupted = c.execute("SELECT supplier_id FROM outbox WHERE status='sending' "
+                                "UNION SELECT id FROM supplier WHERE status='sending'").fetchall()
         c.execute("UPDATE outbox SET status='uncertain',error='执行进程中断，结果待核实；请查看 QQ，禁止自动重发',updated_at=? WHERE status='sending'", (time.time(),))
         c.execute("UPDATE supplier SET status='send_uncertain',error='发送期间进程中断，请核实 QQ；禁止自动重发' WHERE status='sending'")
+    for row in interrupted:
+        incidents.record("send_uncertain", "recovery", severity="error", supplier_id=row[0])
 
 
 def process_one(win, pacing, cancelled=lambda: False):
@@ -69,15 +74,21 @@ def process_one(win, pacing, cancelled=lambda: False):
         return True
     except qq.DesktopDeferred as e:
         status, error = "deferred", str(e)
+        if isinstance(e, qq.EditorUnavailable) and item.get("error") != error[:300]:
+            incidents.record("uia_control_missing", "qq_controls", severity="warning", supplier_id=sid,
+                             extra={"control": "editor"})
     except SendUncertainError as e:
         status, error = "uncertain", str(e)
     except SupplierIdentityError as e:
         status, error = "failed", str(e)
+        incidents.record("identity_unverified", "reply_send", severity="warning", supplier_id=sid, error=e)
     except Exception as e:
         status = "uncertain" if invoked else "failed"
         error = str(e)
     with db.connect() as c:
         c.execute("UPDATE outbox SET status=?,error=?,updated_at=? WHERE id=? AND status!='cancelled'", (status, error[:300], time.time(), oid))
+    if status == "uncertain":
+        incidents.record("send_uncertain", "reply_send", severity="error", supplier_id=sid)
     return True
 
 

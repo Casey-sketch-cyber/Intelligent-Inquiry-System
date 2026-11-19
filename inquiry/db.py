@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS inquiry_job (
     id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL,
     created_at REAL NOT NULL, started_at REAL, finished_at REAL, error TEXT
 );
+CREATE TABLE IF NOT EXISTS incident (
+    id INTEGER PRIMARY KEY, created_at REAL NOT NULL, occurred_date TEXT NOT NULL,
+    kind TEXT NOT NULL, stage TEXT NOT NULL, severity TEXT NOT NULL,
+    payload TEXT NOT NULL, dedupe_key TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS incident_date_kind ON incident(occurred_date, kind);
 """
 
 
@@ -101,7 +107,7 @@ def connect(*, timeout=30):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA temp_store=MEMORY")
     try:
-        if conn.execute("PRAGMA user_version").fetchone()[0] < 4:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 5:
             conn.executescript(SCHEMA)
             for table, col, typ in MIGRATIONS:
                 if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
@@ -110,7 +116,7 @@ def connect(*, timeout=30):
                     except sqlite3.OperationalError:
                         if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
                             raise
-            conn.execute("PRAGMA user_version=4")
+            conn.execute("PRAGMA user_version=5")
         yield conn
         conn.commit()
     finally:

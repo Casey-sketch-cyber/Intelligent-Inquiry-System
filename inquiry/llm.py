@@ -63,12 +63,16 @@ def parse_reply(part_no: str, qty: int, inquiry_text: str, replies: list[str], m
         response_format={"type": "json_object"},
         temperature=0,
     )
-    content = resp.choices[0].message.content or "{}"
+    content = resp.choices[0].message.content or ""
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
         m = re.search(r"\{.*\}", content, re.S)
-        data = json.loads(m.group()) if m else {}
+        if not m:
+            raise
+        data = json.loads(m.group())
+    if not isinstance(data, dict):
+        raise ValueError("模型回复不是 JSON 对象")
     result = normalize(data)
     candidates = data.get("reply_suggestions")
     candidates = candidates if isinstance(candidates, list) else []
