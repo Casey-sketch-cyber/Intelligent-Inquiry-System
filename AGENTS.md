@@ -19,7 +19,7 @@
 
 ## 工作规则
 
-1. 开工前读 `docs/PROGRESS.md`、`docs/ARCHITECTURE.md` 和 `docs/DECISIONS.md`。在 `D:\PROJECT\lzt` 的本地项目中，同时按工作区规则读写根目录的私有 `PROGRESS.md`。
+1. 开工前读 `docs/PROGRESS.md`、`docs/ARCHITECTURE.md`、`docs/DECISIONS.md` 和 `docs/TASKS.md`。从 `docs/TASKS.md` 领任务，遵守其中的红线和验收标准。在 `D:\PROJECT\lzt` 的本地项目中，同时按工作区规则读写根目录的私有 `PROGRESS.md`。
 2. 检查待处理的审查意见，再从 `main` 为每项任务新建 `<工具名>/<任务简述>` 分支。依赖未合并的任务时，从对应分支开始，并在 PR 说明中注明依赖。
 3. 只改本任务涉及的文件。保持现有命名和结构，新增注释及文档使用中文。添加依赖时说明用途。
 4. 提交前运行相关测试和检查。实际发送 QQ 消息需要用户明确授权。提交只包含源码、测试、示例配置和适合共享的文档。

@@ -84,7 +84,6 @@ class Runner:
         self.tasks: list[Task] = []
         self.sent_times: deque = deque()
         self.next_send_at = 0.0
-        self.last_search_at = 0.0
         self.chat_owner: dict[str, list[tuple[Task, int]]] = {}
         self.last_sig: dict[int, tuple] = {}
         self.last_read_at: dict[int, float] = {}
@@ -196,6 +195,8 @@ class Runner:
             self.make_tasks()
             try:
                 for t in self.tasks:
+                    if self.stop_requested():
+                        break
                     if t.id not in self.resume and t.sent < int(self.cfg.get("max_suppliers", 30)):
                         self.load_candidates(context, t)
                 if self.dry_run:
@@ -203,7 +204,7 @@ class Runner:
                         log(f"[试运行] {t.part_no} 可询价供应商 {len(t.candidates)} 家：")
                         for r in list(t.candidates)[:20]:
                             log(f"    {r['company']} | 库存 {r['qty']} | 批号 {r['batch']} | 日期 {r['date']} | QQ {','.join(q['uin'] for q in r['qqs'])}")
-                        db.finish_task(t.id, "dry-run")
+                        db.finish_task(t.id, "stopped" if self.stop_requested() else "dry-run")
                     return None
                 self.loop(context)
             except KeyboardInterrupt:
@@ -242,23 +243,22 @@ class Runner:
         max_pages = int(self.filter.get("max_pages", 3))
         if t.pages_loaded >= max_pages:
             return False
-        if self.send_only and self.last_search_at:
-            delay = max(0, 30 - (time.time() - self.last_search_at))
-            self.idle(delay, poll=False)
-            if self.stop_requested():
-                return False
-        t.pages_loaded += 1
+        page_no = t.pages_loaded + 1
         try:
-            self.last_search_at = time.time()
-            self.page, rows = icnet.search(context, t.part_no, t.pages_loaded)
+            self.page, rows = icnet.search(context, t.part_no, page_no, cancelled=self.stop_requested)
+        except icnet.SearchCancelled:
+            return False
         except icnet.NotLoggedIn:
             raise
         except Exception as e:
-            log(f"{t.part_no} 第 {t.pages_loaded} 页加载失败：{e}")
+            t.pages_loaded = page_no
+            log(f"{t.part_no} 第 {page_no} 页加载失败：{e}")
             return False
+        t.pages_loaded = page_no
         if t.pages_loaded == 1:
             db.set_ref_price(t.id, icnet.ref_price(self.page))
-        exclude = ({s["company"] for s in db.suppliers(t.id)} | {r["company"] for r in t.candidates}
+        exclude = ({s["company"] for s in db.suppliers(t.id) if s["status"] != "waiting_search"}
+                   | {r["company"] for r in t.candidates}
                    | db.recently_asked(t.part_no, float(self.cfg.get("skip_recent_hours", 24))))
         picked = icnet.candidate_rows(rows, t.part_no, t.qty, self.filter, exclude)
         if self.only:
@@ -374,7 +374,8 @@ class Runner:
         elif isolation.MANUAL.is_set() or isolation.DRAINING.is_set():
             raise qq.DesktopDeferred("工作机已暂停，未打开新会话")
         try:
-            found = icnet.find_row(self.context, t.part_no, row, int(self.filter.get("max_pages", 3)))
+            found = icnet.find_row(self.context, t.part_no, row, int(self.filter.get("max_pages", 3)),
+                                   cancelled=self.stop_requested)
             if found is None:
                 raise RuntimeError("搜索结果里找不到这家供应商了（可能已下架）")
             self.page, row = found
@@ -421,7 +422,7 @@ class Runner:
         sid = db.add_supplier(t.id, row)
         if sid is None:
             old = next((dict(s) for s in db.suppliers(t.id) if s["company"] == row["company"]), {})
-            if old.get("status") != "waiting_desktop":
+            if old.get("status") not in {"waiting_desktop", "waiting_search"}:
                 return False
             sid = old["id"]
         if not self.wait_rate_limit():
@@ -454,6 +455,12 @@ class Runner:
                 db.update_supplier(sid, status="sending", chat_name=name, attempted_at=time.time())
                 invoked = True
                 qq.send_text(self.win, t.text, expect_chat=name, company=company)
+        except icnet.SearchCancelled as e:
+            db.update_supplier(sid, status="waiting_search", error=str(e))
+            return False
+        except icnet.NotLoggedIn as e:
+            db.update_supplier(sid, status="waiting_search", error=str(e))
+            raise
         except qq.DesktopDeferred as e:
             prior = db.supplier(sid)
             db.update_supplier(sid, status="waiting_desktop", chat_name=name or prior.get("chat_name"), error=str(e)[:300])

@@ -336,7 +336,9 @@ def dispatch(cfg, method, route, body, query):
                 from inquiry import db, icnet
                 with db.connect() as conn:
                     part = conn.execute("SELECT part_no FROM task WHERE id=?", (supplier["task_id"],)).fetchone()[0]
-                found = icnet.find_row(context,part,{"company":supplier["company"],"qqs":[{"uin":supplier["qq_uin"]}]},1)
+                found = icnet.find_row(context, part,
+                                       {"company": supplier["company"], "qqs": [{"uin": supplier["qq_uin"]}]},
+                                       1, source="diagnostic", wait=False)
                 if not found: raise ValueError("The recorded supplier is not in the current IC result")
                 page,row = found
                 probe = icnet.launch_qq(page,row,timeout=12)
