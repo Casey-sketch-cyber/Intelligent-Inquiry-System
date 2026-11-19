@@ -9,7 +9,7 @@ from urllib.parse import quote, urlparse, unquote
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 
-from . import search_pacing
+from . import incidents, search_pacing
 from .settings import DATA_DIR
 
 SEARCH_URL = "https://www.ic.net.cn/search/{part}.html"
@@ -21,6 +21,14 @@ class NotLoggedIn(RuntimeError):
 
 
 class SearchCancelled(RuntimeError):
+    pass
+
+
+class QQLaunchFailed(RuntimeError):
+    pass
+
+
+class TemporarySessionRefused(RuntimeError):
     pass
 
 
@@ -60,6 +68,7 @@ def search(context: BrowserContext, part_no: str, page_no: int = 1, *,
         if cancelled():
             raise SearchCancelled("已停止等待 IC交易网搜索")
         if any(urlparse(p.url).path == "/searchPnCode.php" for p in context.pages):
+            incidents.record("captcha", "search", severity="warning")
             raise NotLoggedIn("IC交易网仍在等待网站校验，请人工完成后继续；没有重新发送搜索请求")
 
     check()
@@ -69,8 +78,10 @@ def search(context: BrowserContext, part_no: str, page_no: int = 1, *,
     check()
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     if "member.ic.net.cn/login" in page.url:
+        incidents.record("login_required", "search", severity="warning")
         raise NotLoggedIn("IC交易网没有登录，请在系统打开的 Edge 窗口里扫码登录")
     if urlparse(page.url).path == "/searchPnCode.php":
+        incidents.record("captcha", "search", severity="warning")
         raise NotLoggedIn("IC交易网要求人工检查，请在专用浏览器完成网站校验后继续；未自动重试搜索")
     page.wait_for_selector("#resultList > li", timeout=30000)
     time.sleep(1)  # 等脚本把混淆用的隐藏元素处理完

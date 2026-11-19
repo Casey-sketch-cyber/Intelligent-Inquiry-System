@@ -5,7 +5,7 @@ import re
 import time
 import uuid
 
-from . import db
+from . import db, incidents
 
 
 def part_key(value):
@@ -50,7 +50,11 @@ def validate_template(template):
 
 
 def reply_digest(sid):
-    return hashlib.sha256(json.dumps(db.messages(sid, "in"), ensure_ascii=False).encode()).hexdigest()
+    return _digest(db.messages(sid, "in"))
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def conversation(sid):
@@ -61,7 +65,7 @@ def conversation(sid):
     return dict(row)
 
 
-def queue_reply(sid, text, request_id):
+def queue_reply(sid, text, request_id, suggestion=None):
     record = conversation(sid)
     text = str(text).strip()
     if not text or len(text) > 2000:
@@ -89,7 +93,16 @@ def queue_reply(sid, text, request_id):
         cur = c.execute(
             "INSERT INTO outbox(request_id,supplier_id,company,chat_name,qq_uin,content,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',?,?)",
             (request_id, sid, record["company"], record["chat_name"], record["qq_uin"], content, time.time(), time.time()))
-        return dict(c.execute("SELECT * FROM outbox WHERE id=?", (cur.lastrowid,)).fetchone())
+        item = dict(c.execute("SELECT * FROM outbox WHERE id=?", (cur.lastrowid,)).fetchone())
+        edited = False
+        if isinstance(suggestion, dict) and type(suggestion.get("index")) is int:
+            current = _suggestions_for(c, sid)
+            index = suggestion["index"]
+            if 0 <= index < len(current["items"]) and suggestion.get("digest") == current["digest"]:
+                edited = current["items"][index] != content
+    if edited:
+        incidents.record("suggestion_edited", "suggestions", severity="info", supplier_id=sid)
+    return item
 
 
 def outbox_for(sid):
@@ -117,13 +130,27 @@ def enqueue_analysis(sid, refresh=False):
 
 
 def suggestions_for(sid):
-    digest = reply_digest(sid)
     with db.connect() as c:
-        row = c.execute("SELECT * FROM analysis_job WHERE supplier_id=?", (sid,)).fetchone()
+        c.execute("BEGIN")
+        return _suggestions_for(c, sid)
+
+
+def _suggestions_for(conn, sid):
+    row = conn.execute("SELECT * FROM analysis_job WHERE supplier_id=?", (sid,)).fetchone()
     if not row:
         return {"status": "none", "items": []}
-    return {"status": row["status"], "items": json.loads(row["suggestions"] or "[]") if row["digest"] == digest else [],
-            "error": row["error"], "digest": row["digest"]}
+    replies = conn.execute("SELECT content FROM message WHERE supplier_id=? AND direction='in' ORDER BY id", (sid,))
+    digest = _digest([reply["content"] for reply in replies])
+    items = json.loads(row["suggestions"] or "[]") if row["digest"] == digest else []
+    return {"status": row["status"], "items": items, "error": row["error"], "digest": _digest([digest, items])}
+
+
+def reject_suggestions(sid, digest):
+    current = suggestions_for(sid)
+    if not current["items"] or current["digest"] != digest:
+        raise ValueError("回复建议已更新，请重新打开会话查看")
+    incidents.record("suggestion_rejected", "suggestions", severity="info", supplier_id=sid,
+                     extra={"suggestion_digest": digest})
 
 
 def save_unassigned(chat_name, message, reason):

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
-from . import db, icnet, llm, qq, report, workbench, dispatch
+from . import db, icnet, incidents, llm, qq, report, workbench, dispatch
 from .history import HistoryReadError, covers_previous, normalized
 from .identity import SendUncertainError, SupplierIdentityError, name_matches
 from .settings import DATA_DIR, ROOT, SETTINGS
@@ -373,17 +373,21 @@ class Runner:
             qq.require_assisted_foreground(self.win)
         elif isolation.MANUAL.is_set() or isolation.DRAINING.is_set():
             raise qq.DesktopDeferred("工作机已暂停，未打开新会话")
+
+        def check_refusal():
+            if message := icnet.qq_launch_error(jump):
+                raise icnet.TemporarySessionRefused(message)
+
+        found = icnet.find_row(self.context, t.part_no, row, int(self.filter.get("max_pages", 3)),
+                               cancelled=self.stop_requested)
+        if found is None:
+            raise RuntimeError("搜索结果里找不到这家供应商了（可能已下架）")
+        self.page, row = found
         try:
-            found = icnet.find_row(self.context, t.part_no, row, int(self.filter.get("max_pages", 3)),
-                                   cancelled=self.stop_requested)
-            if found is None:
-                raise RuntimeError("搜索结果里找不到这家供应商了（可能已下架）")
-            self.page, row = found
             before = qq.current_chat_name(self.win)
             jump = icnet.launch_qq(self.page, row, before_launch=(lambda: None) if dedicated else lambda: qq.require_assisted_foreground(self.win))
             origin = icnet.settle_origin(jump)
-            from . import isolation
-            if isolation.ENABLED and isolation.MODE == "worker":
+            if dedicated:
                 from lanhost.support import confirm_qq_dialog
                 if confirm_qq_dialog(cancelled=self.stop_requested,opened=lambda:bool((current:=qq.current_chat_name(self.win))) and current!=before):
                     log("  已确认专用浏览器的腾讯 QQ 唤起许可")
@@ -392,7 +396,12 @@ class Runner:
                 log(f"  如果浏览器弹出“打开QQ”的确认框（来自 {origin}）：请先勾选“始终允许”，再点“打开”")
             t0 = time.time()
             name = qq.wait_chat_change(self.win, before, timeout=20 if known else 90, cancelled=self.stop_requested,
-                                       launch_error=lambda:icnet.qq_launch_error(jump))
+                                       launch_error=check_refusal)
+        except (qq.DesktopDeferred, icnet.SearchCancelled, icnet.NotLoggedIn, icnet.TemporarySessionRefused):
+            raise
+        except Exception as exc:
+            raise icnet.QQLaunchFailed(str(exc)) from exc
+        else:
             # 几秒内自动打开说明浏览器已"始终允许"这个来源；要等人点确认框的不算
             if name is not None and not known and time.time() - t0 < 10:
                 self.ok_origins.add(origin)
@@ -406,7 +415,7 @@ class Runner:
             cur = qq.current_chat_name(self.win)
             if cur and name_matches(company, cur, qq.profile_company(self.win)):
                 return cur  # 本来就停在这个会话上
-            raise RuntimeError("QQ 没有打开新的会话（对方可能不支持临时会话，或 QQ 弹出了其他窗口）")
+            raise icnet.QQLaunchFailed("QQ 没有打开新的会话（对方可能不支持临时会话，或 QQ 弹出了其他窗口）")
         return name
 
     def inquire(self, t: Task, row: dict) -> bool:
@@ -466,21 +475,31 @@ class Runner:
             db.update_supplier(sid, status="waiting_desktop", chat_name=name or prior.get("chat_name"), error=str(e)[:300])
             if prior.get("error") != str(e)[:300]:
                 log(f"  暂停 {company}：{e}")
+                if isinstance(e, qq.EditorUnavailable):
+                    incidents.record("uia_control_missing", "qq_controls", severity="warning", task_id=t.id,
+                                     supplier_id=sid, extra={"control": "editor"})
             return None
         except SendUncertainError as e:
             db.update_supplier(sid, status="send_uncertain", chat_name=name, attempted_at=time.time(), error=str(e)[:300])
             log(f"  ! {company}：发送结果待核实，已禁止自动重发：{e}")
             self._stop = True
+            incidents.record("send_uncertain", "inquiry_send", severity="error", task_id=t.id, supplier_id=sid, error=e)
             return False
         except SupplierIdentityError as e:
             db.update_supplier(sid, status="identity_unverified", chat_name=name, error=str(e)[:300])
             log(f"  ✗ {company}：身份未核实，未发送：{e}")
+            incidents.record("identity_unverified", "inquiry_send", severity="warning", task_id=t.id, supplier_id=sid, error=e)
             return False
         except Exception as e:
             self.cleanup_draft(name, t.text)
             db.update_supplier(sid, status="send_uncertain" if invoked else "failed", chat_name=name, error=str(e)[:300])
             if invoked:
                 self._stop = True
+                incidents.record("send_uncertain", "inquiry_send", severity="error", task_id=t.id, supplier_id=sid, error=e)
+            elif isinstance(e, icnet.QQLaunchFailed):
+                incidents.record("qq_launch_failed", "qq_launch", severity="error", task_id=t.id, supplier_id=sid, error=e)
+            elif isinstance(e, icnet.TemporarySessionRefused):
+                incidents.record("temp_session_refused", "qq_launch", severity="warning", task_id=t.id, supplier_id=sid, error=e)
             log(f"  ✗ {company}：{e}")
             return False
         # 文字一发出去就立刻记账，再发名片；这样就算后面出问题，也不会因为漏记而重复询价
@@ -527,6 +546,10 @@ class Runner:
                 notes.append(f"名片没发出去：{e}")
                 db.update_supplier(sid, error="；".join(notes))
                 log(f"  ! {company}：询价已发，但名片没发出去：{e}")
+                if isinstance(e, SendUncertainError):
+                    incidents.record("send_uncertain", "inquiry_send", severity="error", task_id=t.id, supplier_id=sid, error=e)
+                elif isinstance(e, SupplierIdentityError):
+                    incidents.record("identity_unverified", "inquiry_send", severity="warning", task_id=t.id, supplier_id=sid, error=e)
         log(f"  ✓ 已询价 {company} → QQ会话「{name}」"
             + ("（聊天记录里已有同样询价，未重复发送）" if already else ""))
         return True
@@ -618,7 +641,10 @@ class Runner:
             if qq.current_chat_name(self.win) != name:
                 raise HistoryReadError("读取后会话变化，请稍后补收")
         except Exception as e:
-            db.update_supplier(sid, read_error=str(e)[:300])
+            reason = str(e)[:300]
+            db.update_supplier(sid, read_error=reason)
+            if reason != record.get("read_error") and not self.stop_requested():
+                incidents.record("read_incomplete", "collection", severity="warning", task_id=t.id, supplier_id=sid, error=e)
             return False
         if snapshot.anchor_id:
             db.update_supplier(sid, inquiry_message_id=snapshot.anchor_id)
@@ -656,8 +682,14 @@ class Runner:
             incoming = previous + [m for m in incoming if m["id"] not in {p["id"] for p in previous}]
             replies = [m["text"] for m in incoming]
         if not covers_previous(previous, incoming):
-            db.update_supplier(sid, read_error="本次快照缺少此前已保存的回复，保留原数据，请人工核对后补收")
+            reason = "本次快照缺少此前已保存的回复，保留原数据，请人工核对后补收"
+            db.update_supplier(sid, read_error=reason)
+            if reason != record.get("read_error"):
+                incidents.record("read_incomplete", "collection", severity="warning", task_id=t.id, supplier_id=sid)
             return False
+        # 已标记待补收时，重复读到同一份不完整快照不再重复记日志。
+        if not snapshot.complete and not (record.get("read_error") or "").endswith("补收"):
+            incidents.record("read_incomplete", "collection", severity="warning", task_id=t.id, supplier_id=sid)
         if not replies:
             db.update_supplier(sid, read_error=None if snapshot.complete else "仅检查了当前可见记录，完整历史待补收", last_checked_at=time.time())
             return snapshot.complete
@@ -682,6 +714,7 @@ class Runner:
                 c.execute("UPDATE quote SET valid=0 WHERE supplier_id=?", (sid,))
             db.update_supplier(sid, status="parse_pending", read_error=f"回复已保存，解析待重试：{str(e)[:200]}", last_reply_at=reply_at)
             log(f"  解析 {name} 的回复失败（稍后重试）：{e}")
+            incidents.record_parse_failure("analysis", e, task_id=t.id, supplier_id=sid)
             return False
         valid = q["status"] == "quoted" and q["unit_price"] is not None
         db.save_quote(sid, q, valid)

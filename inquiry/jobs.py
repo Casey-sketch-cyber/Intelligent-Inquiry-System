@@ -3,7 +3,7 @@ import argparse
 import json
 import time
 import uuid
-from . import db, isolation, workbench
+from . import db, incidents, isolation, workbench
 
 
 def submit(body, settings):
@@ -89,12 +89,15 @@ def dispatch_one():
         if server.run_state()["running"]:
             return
         state = server.browser_status()
-        blocked = state.get("code") in ("verification", "login")
-        with db.connect() as c:
-            if blocked:
-                c.execute("UPDATE inquiry_job SET status='waiting_verification',error=? WHERE status='queued'", ("请在第二台完成网站登录或验证码；本批次没有重新搜索",))
+        code = state.get("code")
+        if code in ("verification", "login"):
+            with db.connect() as c:
+                changed = c.execute("UPDATE inquiry_job SET status='waiting_verification',error=? WHERE status='queued'", ("请在第二台完成网站登录或验证码；本批次没有重新搜索",)).rowcount
                 c.execute("UPDATE task SET status='waiting_verification' WHERE status='queued' AND batch_id IN (SELECT id FROM inquiry_job WHERE status='waiting_verification')")
-                return
+            if changed:
+                incidents.record("captcha" if code == "verification" else "login_required", "queue", severity="warning")
+            return
+        with db.connect() as c:
             c.execute("UPDATE inquiry_job SET status='queued',error=NULL WHERE status='waiting_verification'")
             c.execute("UPDATE task SET status='queued' WHERE status='waiting_verification' AND batch_id IN (SELECT id FROM inquiry_job WHERE status='queued')")
             row = c.execute("SELECT id,payload FROM inquiry_job WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()

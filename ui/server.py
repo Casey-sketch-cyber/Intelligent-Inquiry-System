@@ -32,7 +32,7 @@ import win32gui  # noqa: E402
 import win32process  # noqa: E402
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory  # noqa: E402
 
-from inquiry import browser, db, report, workbench, analysis, observer  # noqa: E402
+from inquiry import browser, db, incidents, report, workbench, analysis, observer  # noqa: E402
 from inquiry.qq import exe_of  # noqa: E402
 from inquiry.runner import render_message  # noqa: E402
 from inquiry.settings import DATA_DIR  # noqa: E402
@@ -393,6 +393,17 @@ def reply_suggestions(sid):
     return jsonify(ok=True)
 
 
+@app.post("/api/suppliers/<int:sid>/suggestion-rejection")
+def reject_suggestions(sid):
+    workbench.reject_suggestions(sid, request.get_json(force=True).get("digest"))
+    return jsonify(ok=True)
+
+
+@app.get("/api/incidents")
+def incident_summary():
+    return jsonify(incidents.summary(int(request.args.get("days", 14))))
+
+
 def start_reply_worker(assist=False):
     with SPAWN_LOCK:
         if not run_state()["running"]:
@@ -422,7 +433,7 @@ def reply(sid):
     body = request.get_json(force=True)
     if body.get("confirm_send") is not True:
         raise ValueError("请在回复区点击「发送到 QQ」确认")
-    result = workbench.queue_reply(sid, body.get("text", ""), body.get("request_id"))
+    result = workbench.queue_reply(sid, body.get("text", ""), body.get("request_id"), body.get("suggestion"))
     if result["status"] == "queued":
         start_reply_worker(load_settings().get("desktop", {}).get("foreground_assist", False))
     return jsonify(result), 202

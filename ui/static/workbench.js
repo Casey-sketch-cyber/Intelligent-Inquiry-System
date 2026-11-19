@@ -89,19 +89,26 @@ async function openConversation(sid) {
     if (!draft.sending) draft.requestId = crypto.randomUUID();
   };
   $("#refreshSuggestions").onclick = async () => {
-    try { await api(`/api/suppliers/${sid}/suggestions`, { json: {} }); await refreshConversation(); }
+    try {
+      await api(`/api/suppliers/${sid}/suggestions`, { json: {} });
+      draft.rejectedDigest = null;
+      await refreshConversation();
+    }
     catch (e) { toast(e.message, "bad"); }
   };
   $("#sendReply").onclick = async () => {
-    if (draft.sending) return;
+    if (draft.sending || draft.rejecting) return;
     const text = $("#replyText").value.trim();
     if (!text) { toast("请先填写回复", "bad"); return; }
     draft.sending = true;
     $("#sendReply").disabled = true;
     $("#replyText").disabled = true;
     try {
-      const item = await api(`/api/suppliers/${sid}/reply`, { json: { text, request_id: draft.requestId, confirm_send: true } });
+      const payload = { text, request_id: draft.requestId, confirm_send: true };
+      if (draft.suggestion) payload.suggestion = draft.suggestion;
+      const item = await api(`/api/suppliers/${sid}/reply`, { json: payload });
       draft.text = "";
+      draft.suggestion = null;
       draft.requestId = crypto.randomUUID();
       if (activeConversation === sid) $("#replyText").value = "";
       toast(OUTBOX_TEXT[item.status] || "已加入发送队列");
@@ -131,8 +138,12 @@ async function refreshConversation() {
     $("#unassignedMessages").innerHTML = d.unassigned.length ? `<div class="notice mt"><div><b>待确认归属的回复</b><p>此 QQ 会话涉及多个型号，确认后再关联。</p>
       ${d.unassigned.map(m => `<div class="unassigned"><p>${esc(m.content)}</p><button class="btn btn-sm" data-assign="${m.id}">关联到 ${esc(d.supplier.part_no)}</button></div>`).join("")}</div></div>` : "";
     const sug = d.suggestions;
-    $("#replySuggestions").innerHTML = sug.items.length ? sug.items.map((text, i) =>
-      `<button class="suggestion" data-suggestion="${i}"><span class="small muted">建议 ${i + 1}</span><span>${esc(text)}</span></button>`).join("")
+    const draft = replyDrafts.get(sid);
+    const rejected = sug.digest && draft.rejectedDigest === sug.digest;
+    $("#replySuggestions").innerHTML = rejected ? `<div class="small muted">本轮建议已标记为不采用</div>`
+      : sug.items.length ? sug.items.map((text, i) =>
+        `<button class="suggestion" data-suggestion="${i}"><span class="small muted">建议 ${i + 1}</span><span>${esc(text)}</span></button>`).join("")
+        + (sug.digest ? `<div><button class="btn btn-sm" id="rejectSuggestions" ${draft.sending || draft.rejecting ? "disabled" : ""}>不采用建议</button></div>` : "")
       : `<div class="small muted">${sug.status === "queued" ? "DeepSeek 正在生成，原始回复已保存…" : sug.status === "failed" ? "建议生成失败，可重试或直接手动回复。" : "收到回复后自动生成；历史回复可点击上方按钮生成。"}</div>`;
     $("#replyOutbox").innerHTML = d.outbox.length ? `<div class="mt"><b>发送记录</b>${d.outbox.map(m =>
       `<div class="outbox-item"><div>${esc(m.content)}</div><div class="row wrap small"><b>${esc(OUTBOX_TEXT[m.status] || m.status)}</b><span class="muted">${fmtTime(m.updated_at)}</span>
@@ -140,12 +151,38 @@ async function refreshConversation() {
       ${["queued", "deferred"].includes(m.status) ? `<button class="btn btn-sm" data-cancel="${m.id}">取消</button>` : ""}</div>
       ${m.error ? `<div class="small err">${esc(m.error)}</div>` : ""}</div>`).join("")}</div>` : "";
     const blocked = d.outbox.some(m => ["queued", "deferred", "sending", "uncertain"].includes(m.status));
-    $("#sendReply").disabled = !d.supplier.sent_at || !d.supplier.qq_uin || blocked || replyDrafts.get(sid).sending;
+    $("#sendReply").disabled = !d.supplier.sent_at || !d.supplier.qq_uin || blocked || draft.sending || draft.rejecting;
     $("#replyNotice").textContent = blocked ? "请先处理上方待发送或待核实记录。" : "";
+    const rejectButton = $("#rejectSuggestions");
+    if (rejectButton) rejectButton.onclick = async () => {
+      if (draft.sending || draft.rejecting) return;
+      draft.rejecting = true;
+      rejectButton.disabled = true;
+      $("#sendReply").disabled = true;
+      try {
+        await api(`/api/suppliers/${sid}/suggestion-rejection`, { json: { digest: sug.digest } });
+        draft.rejectedDigest = sug.digest;
+        if (draft.suggestion?.digest === sug.digest) {
+          if (draft.text === draft.suggestionText) {
+            draft.text = "";
+            if (activeConversation === sid) $("#replyText").value = "";
+          }
+          draft.suggestion = null;
+          draft.requestId = crypto.randomUUID();
+        }
+      } catch (e) {
+        toast(e.message, "bad");
+      } finally {
+        draft.rejecting = false;
+        if (activeConversation === sid) await refreshConversation();
+      }
+    };
     document.querySelectorAll("[data-suggestion]").forEach(b => b.onclick = () => {
-      const draft = replyDrafts.get(sid);
-      if (draft.sending) return;
-      draft.text = sug.items[+b.dataset.suggestion];
+      if (draft.sending || draft.rejecting) return;
+      const index = +b.dataset.suggestion;
+      draft.text = sug.items[index];
+      draft.suggestion = sug.digest ? { digest: sug.digest, index } : null;
+      draft.suggestionText = draft.text;
       draft.requestId = crypto.randomUUID();
       $("#replyText").value = draft.text;
       $("#replyText").focus();

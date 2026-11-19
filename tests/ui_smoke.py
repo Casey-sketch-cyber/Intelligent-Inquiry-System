@@ -7,13 +7,13 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from inquiry import db, llm, qq, runtime, workbench
+from inquiry import db, incidents, llm, qq, runtime, workbench
 from ui import server, service
 from playwright.sync_api import sync_playwright
 
 
 def main():
-    output = runtime.DATA_DIR / "qa" / "20261023-reply-body"
+    output = runtime.DATA_DIR / "qa" / "20261119-runtime-incidents"
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=runtime.TEMP_DIR, prefix="ui-smoke-") as folder:
         folder = Path(folder)
@@ -27,6 +27,7 @@ def main():
                  "deepseek": {"ok": True, "text": "模拟解析"}, "card": {"ok": False, "text": "未启用"}}), \
              patch.object(llm, "_client", side_effect=AssertionError("禁止真实模型调用")), \
              patch.object(qq, "send_text", side_effect=AssertionError("禁止真实发送")), \
+             patch.object(incidents, "_versions", return_value={"qq_version": "9.9.1.0", "edge_version": "140.0.0.0"}), \
              patch.object(server.analysis, "start", Mock()):
             t1 = db.create_task("STM32F405RGT6", 5000)
             t2 = db.create_task("STM32F405RGT6", 3000)
@@ -40,6 +41,7 @@ def main():
                 c.execute("UPDATE analysis_job SET status='done',suggestions=? WHERE supplier_id=?",
                           (json.dumps(["暂无目标价，请报实价支持谈单。", "请按 3000pcs 报含税单价，谢谢。", "请先确认现货数量和批次。"], ensure_ascii=False), sid))
             workbench.save_unassigned("示例电子/采购对接", {"id": "ambiguous", "text": "整包出", "time": "12:00"}, "多个型号")
+            incidents.record("captcha", "search", severity="warning")
             httpd = service.bind_server(server.app, 0)
             thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             thread.start()
@@ -49,7 +51,9 @@ def main():
                                                  headless=True, args=[f"--disk-cache-dir={folder / 'cache'}", f"--crash-dumps-dir={folder / 'crashes'}"])
                     page = browser.new_page(viewport={"width": 1440, "height": 1000}, device_scale_factor=1)
                     errors = []
+                    requests = []
                     page.on("pageerror", lambda err: errors.append(str(err)))
+                    page.on("request", lambda request: requests.append(request))
                     base = f"http://127.0.0.1:{httpd.port}/"
                     page.goto(base + "#/tasks")
                     page.locator("#modelsTable tbody tr").first.wait_for()
@@ -70,12 +74,38 @@ def main():
                     page.emulate_media(color_scheme="dark")
                     page.screenshot(path=str(output / "conversation-dark.png"), full_page=True)
                     page.emulate_media(color_scheme="light")
-                    page.locator("#sendReply").click()
-                    page.wait_for_timeout(300)
+                    with page.expect_response(lambda res: res.url.endswith(f"/api/suppliers/{sid}/reply")
+                                              and res.request.method == "POST") as reply:
+                        page.locator("#sendReply").click()
+                    assert reply.value.ok, reply.value.text()
+                    assert reply.value.request.post_data_json["suggestion"] == {"digest": workbench.suggestions_for(sid)["digest"], "index": 0}
                     assert len(workbench.outbox_for(sid)) == 1
                     assert workbench.outbox_for(sid)[0]["status"] == "queued"
                     assert workbench.outbox_for(sid)[0]["content"] == "这是一条模拟回复，不真实发送。"
+                    reject_path = f"/api/suppliers/{sid}/suggestion-rejection"
+                    assert not any(r.url.endswith(reject_path) for r in requests)
+                    page.locator("#replyText").fill("保留未发送的手写草稿")
+                    with page.expect_response(lambda res: res.url.endswith(reject_path)
+                                              and res.request.method == "POST") as reject:
+                        page.get_by_role("button", name="不采用建议").click()
+                    assert reject.value.ok, reject.value.text()
+                    assert reject.value.request.post_data_json == {"digest": workbench.suggestions_for(sid)["digest"]}
+                    page.get_by_text("本轮建议已标记为不采用", exact=True).wait_for()
+                    assert page.locator("#replyText").input_value() == "保留未发送的手写草稿"
+                    assert len(workbench.outbox_for(sid)) == 1
                     page.locator("#closeConversation").click()
+
+                    with page.expect_response(lambda res: res.url.endswith("/api/incidents?days=14")) as issue_response:
+                        page.get_by_role("link", name="运行问题", exact=True).click()
+                    assert issue_response.value.ok
+                    page.get_by_role("heading", name="按类型统计", exact=True).wait_for()
+                    expected = ["网站验证码", "1", "编辑建议后提交", "1", "明确不采用建议", "1"]
+                    assert page.locator("#incidentTypes tbody td").all_text_contents() == expected
+                    daily_captcha = page.locator("#incidentDates tbody tr").filter(has_text="网站验证码")
+                    assert daily_captcha.locator("td").all_text_contents()[1:] == ["网站验证码", "1"]
+                    assert len(page.locator("#incidentDates tbody tr").all_text_contents()) == 3
+                    page.screenshot(path=str(output / "incidents.png"), full_page=True, animations="disabled")
+
                     page.goto(base + "#/new")
                     page.locator("#btnPaste").click()
                     page.locator("#batchQty").fill("5k")
@@ -102,7 +132,7 @@ def main():
                     page.screenshot(path=str(output / "settings.png"), full_page=True)
                     assert not errors, errors
                     browser.close()
-                print("UI smoke passed: model grouping/search, conversation draft/choices, one queued reply, 12-part batch preview, card toggle.")
+                print("UI smoke passed: model grouping/search, suggestion edit/rejection, runtime incident summaries, batch preview, card toggle.")
                 print("No real QQ sends or model calls. Screenshots:", output)
             finally:
                 httpd.shutdown()

@@ -4,7 +4,7 @@ import threading
 import time
 import tomllib
 
-from . import db, llm, workbench
+from . import db, incidents, llm, workbench
 from .settings import ROOT
 
 _thread = None
@@ -26,8 +26,12 @@ def process_one():
     outgoing = db.messages(sid, "out")
     try:
         cfg = tomllib.loads((ROOT / "settings.toml").read_text(encoding="utf-8"))
-        q = llm.parse_reply(record["part_no"], record["qty"], outgoing[0] if outgoing else "", replies,
-                            model=cfg.get("llm", {}).get("model"))
+        try:
+            q = llm.parse_reply(record["part_no"], record["qty"], outgoing[0] if outgoing else "", replies,
+                                model=cfg.get("llm", {}).get("model"))
+        except Exception as error:
+            incidents.record_parse_failure("analysis", error, supplier_id=sid)
+            raise
         suggestions = q.pop("reply_suggestions", [])
         with db.connect() as c:
             c.execute("BEGIN IMMEDIATE")

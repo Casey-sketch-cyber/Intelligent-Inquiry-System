@@ -39,6 +39,7 @@ const NAV = [
   ["#/tasks", "询价任务", "list"],
   ["#/reports", "报告文件", "file"],
   ["#/log", "运行日志", "terminal"],
+  ["#/incidents", "运行问题", "alert"],
   ["#/settings", "设置", "settings"],
 ];
 
@@ -535,6 +536,44 @@ async function pollLog() {
   } catch (_) { /* 下次再试 */ }
 }
 
+// ---------- 运行问题 ----------
+async function renderIncidents() {
+  const view = $("#view");
+  view.dataset.page = "incidents";
+  view.innerHTML = `<div class="row between wrap">
+    <span class="small muted" id="incidentDays">最近 14 天</span>
+    <button class="btn btn-sm" id="refreshIncidents" disabled>${icon("refresh", 15)}刷新</button>
+    </div><div id="incidentSummary" class="mt">${empty("正在读取运行问题…", "clock")}</div>`;
+  const summary = $("#incidentSummary", view);
+  const refresh = $("#refreshIncidents", view);
+  refresh.onclick = renderIncidents;
+  try {
+    const data = await api("/api/incidents?days=14");
+    if (!summary.isConnected) return;
+    $("#incidentDays", view).textContent = `最近 ${data.days} 天`;
+    if (!data.by_type.length) {
+      summary.innerHTML = `<div class="card fade">${empty("这段时间没有运行问题记录", "check")}</div>`;
+      return;
+    }
+    summary.innerHTML = `<div class="grid g2 fade">
+      <div class="card"><div class="card-h"><h3>按类型统计</h3></div>
+        <div class="table-wrap"><table class="t" id="incidentTypes">
+          <thead><tr><th scope="col">问题类型</th><th scope="col" class="num">次数</th></tr></thead>
+          <tbody>${data.by_type.map(row => `<tr><td>${esc(row.label)}</td><td class="num">${esc(row.count)}</td></tr>`).join("")}</tbody>
+        </table></div></div>
+      <div class="card"><div class="card-h"><h3>按日期统计</h3></div>
+        <div class="table-wrap"><table class="t" id="incidentDates">
+          <thead><tr><th scope="col">日期</th><th scope="col">问题类型</th><th scope="col" class="num">次数</th></tr></thead>
+          <tbody>${data.by_date.map(row => `<tr><td>${esc(row.date)}</td><td>${esc(row.label)}</td><td class="num">${esc(row.count)}</td></tr>`).join("")}</tbody>
+        </table></div></div>
+    </div>`;
+  } catch (e) {
+    if (summary.isConnected) summary.innerHTML = `<div class="card fade">${empty(e.message, "alert")}</div>`;
+  } finally {
+    refresh.disabled = false;
+  }
+}
+
 // ---------- 报告文件 ----------
 async function renderReports() {
   const view = $("#view");
@@ -663,6 +702,7 @@ const TITLES = {
   "#/tasks": ["询价任务", "每个型号的询价进度和报价"],
   "#/reports": ["报告文件", "导出的 Excel 报价报告"],
   "#/log": ["运行日志", ""],
+  "#/incidents": ["运行问题", ""],
   "#/settings": ["设置", "话术、名片和询价参数"],
 };
 
@@ -682,6 +722,7 @@ function route() {
   else if (h === "#/tasks") renderTasks();
   else if (h === "#/reports") renderReports();
   else if (h === "#/log") renderLog();
+  else if (h === "#/incidents") renderIncidents();
   else if (h === "#/settings") renderSettings();
   else renderDashboard(true);
 }

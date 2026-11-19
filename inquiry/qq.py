@@ -12,6 +12,7 @@ import win32con
 import win32gui
 import win32process
 
+from . import incidents
 from .history import HistoryReadError, read_history
 from .identity import SendUncertainError, SupplierIdentityError, identity_error
 from .runtime import DATA_DIR
@@ -23,6 +24,10 @@ FOREGROUND_ASSIST = False
 
 class DesktopDeferred(HistoryReadError):
     """后台能力不足或用户切走；保留进度，绝不夺取焦点。"""
+
+
+class EditorUnavailable(DesktopDeferred):
+    """编辑器控件暂时不可读，等待 QQ 就绪后可重试。"""
 
 
 def require_assisted_foreground(win):
@@ -278,6 +283,7 @@ def _ready_editor(win, expect_chat: str):
         raise RuntimeError(f"当前会话是 {name!r}，不是 {expect_chat!r}，已取消发送")
     editor = editor_of(win)
     if editor is None:
+        incidents.record("uia_control_missing", "qq_controls", severity="warning", extra={"control": "editor"})
         raise RuntimeError("找不到 QQ 输入框")
     return editor
 
@@ -322,6 +328,7 @@ def _click_send(win, expect_chat: str, what: str, company: str):
         verify_supplier(win, company, expect_chat)
         btn = find(win, "send-msg", auto.ControlType.ButtonControl)
         if btn is None:
+            incidents.record("uia_control_missing", "qq_controls", severity="warning", extra={"control": "send_button"})
             raise RuntimeError("找不到发送按钮")
         verify = lambda: verify_supplier(win, company, expect_chat)
         try:
@@ -376,7 +383,7 @@ def send_text(win, text: str, expect_chat: str, *, company: str) -> None:
     verify_supplier(win, company, expect_chat)
     editor = editor_of(win)
     if editor is None:
-        raise DesktopDeferred("QQ 输入框暂不可读")
+        raise EditorUnavailable("QQ 输入框暂不可读")
     # 标准 UIA Value/Invoke 无需全局键盘、剪贴板或鼠标。
     try:
         value = editor.GetPattern(auto.PatternId.ValuePattern)
@@ -576,6 +583,8 @@ def scroll_region(win, class_name: str, direction: str) -> None:
     """优先用 UIA 滚动；不支持时只在已核对的 QQ 区域内滚动鼠标，不发送按键。"""
     region = find(win, class_name)
     if region is None:
+        control = {"chat-msg-area__vlist": "message_list", "recent-contact-list": "conversation_list"}.get(class_name)
+        incidents.record("uia_control_missing", "qq_controls", severity="warning", extra={"control": control})
         raise HistoryReadError("找不到需要滚动的 QQ 列表")
     try:
         pattern = region.GetPattern(auto.PatternId.ScrollPattern)
