@@ -15,6 +15,8 @@ skip_recent_hours = 24
 min_interval = 20
 max_interval = 45
 max_per_hour = 60
+search_min_interval = 30        # 型号搜索和翻页共用的最短间隔（秒）
+search_max_per_10min = 10       # 任意连续十分钟内最多搜索多少次
 
 [filter]
 require_enough_stock = true

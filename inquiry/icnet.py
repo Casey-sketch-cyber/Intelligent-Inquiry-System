@@ -9,6 +9,7 @@ from urllib.parse import quote, urlparse, unquote
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 
+from . import search_pacing
 from .settings import DATA_DIR
 
 SEARCH_URL = "https://www.ic.net.cn/search/{part}.html"
@@ -16,6 +17,10 @@ EXTRACT_JS = (Path(__file__).parent / "extract_rows.js").read_text(encoding="utf
 
 
 class NotLoggedIn(RuntimeError):
+    pass
+
+
+class SearchCancelled(RuntimeError):
     pass
 
 
@@ -49,11 +54,19 @@ def search_page(context: BrowserContext, part_no=None) -> Page:
     return context.new_page()
 
 
-def search(context: BrowserContext, part_no: str, page_no: int = 1) -> tuple[Page, list[dict]]:
-    if any(urlparse(p.url).path=="/searchPnCode.php" for p in context.pages):
-        raise NotLoggedIn("IC交易网仍在等待网站校验，请人工完成后继续；没有重新发送搜索请求")
+def search(context: BrowserContext, part_no: str, page_no: int = 1, *,
+           cancelled=lambda: False, source="candidates", wait=True) -> tuple[Page, list[dict]]:
+    def check():
+        if cancelled():
+            raise SearchCancelled("已停止等待 IC交易网搜索")
+        if any(urlparse(p.url).path == "/searchPnCode.php" for p in context.pages):
+            raise NotLoggedIn("IC交易网仍在等待网站校验，请人工完成后继续；没有重新发送搜索请求")
+
+    check()
     page = search_page(context, part_no)
     url = SEARCH_URL.format(part=quote(part_no.strip())) + (f"?page={int(page_no)}" if page_no > 1 else "")
+    search_pacing.wait_for_search(part_no, page_no, source, check, wait=wait)
+    check()
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     if "member.ic.net.cn/login" in page.url:
         raise NotLoggedIn("IC交易网没有登录，请在系统打开的 Edge 窗口里扫码登录")
@@ -104,8 +117,11 @@ def _same_supplier(a: dict, b: dict) -> bool:
     return a["company"] == b["company"] and bool({q["uin"] for q in a["qqs"]} & {q["uin"] for q in b["qqs"]})
 
 
-def find_row(context: BrowserContext, part_no: str, row: dict, max_pages: int = 3) -> tuple[Page, dict] | None:
+def find_row(context: BrowserContext, part_no: str, row: dict, max_pages: int = 3, *,
+             cancelled=lambda: False, source="supplier_lookup", wait=True) -> tuple[Page, dict] | None:
     """重新在页面上找到这家供应商当前所在的行（网站每次加载排序都会变，多个型号还共用一个标签页）。"""
+    if cancelled():
+        raise SearchCancelled("已停止定位 IC交易网供应商")
     page = search_page(context, part_no)
     if norm_part(part_no) in norm_part(page.url) and "/search/" in page.url:
         hit = next((r for r in page.evaluate(EXTRACT_JS) if _same_supplier(r, row)), None)
@@ -113,7 +129,7 @@ def find_row(context: BrowserContext, part_no: str, row: dict, max_pages: int = 
             return page, {**row, "index": hit["index"]}
     first = int(row.get("page", 1))
     for p in [first] + [p for p in range(1, max_pages + 1) if p != first]:
-        page, rows = search(context, part_no, p)
+        page, rows = search(context, part_no, p, cancelled=cancelled, source=source, wait=wait)
         hit = next((r for r in rows if _same_supplier(r, row)), None)
         if hit:
             return page, {**row, "index": hit["index"], "page": p}

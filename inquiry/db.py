@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS send_attempt (
 CREATE INDEX IF NOT EXISTS message_supplier ON message(supplier_id, direction);
 CREATE INDEX IF NOT EXISTS supplier_chat ON supplier(chat_name, sent_at);
 CREATE INDEX IF NOT EXISTS attempts_time ON send_attempt(created_at);
+CREATE TABLE IF NOT EXISTS search_attempt (
+    id INTEGER PRIMARY KEY, created_at REAL NOT NULL,
+    part_no TEXT NOT NULL, page_no INTEGER NOT NULL, source TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS search_attempts_time ON search_attempt(created_at);
 CREATE TABLE IF NOT EXISTS inquiry_job (
     id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL,
     created_at REAL NOT NULL, started_at REAL, finished_at REAL, error TEXT
@@ -91,12 +96,12 @@ MIGRATIONS = [
 
 
 @contextmanager
-def connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+def connect(*, timeout=30):
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA temp_store=MEMORY")
     try:
-        if conn.execute("PRAGMA user_version").fetchone()[0] < 3:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 4:
             conn.executescript(SCHEMA)
             for table, col, typ in MIGRATIONS:
                 if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
@@ -105,7 +110,7 @@ def connect():
                     except sqlite3.OperationalError:
                         if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
                             raise
-            conn.execute("PRAGMA user_version=3")
+            conn.execute("PRAGMA user_version=4")
         yield conn
         conn.commit()
     finally:

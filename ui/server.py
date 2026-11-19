@@ -79,6 +79,8 @@ SETTINGS_SCHEMA = [
     ("pacing", "min_interval", float, "两条询价之间最短间隔（秒），太快容易被 QQ 风控"),
     ("pacing", "max_interval", float, "两条询价之间最长间隔（秒）"),
     ("pacing", "max_per_hour", int, "每小时最多发几条"),
+    ("pacing", "search_min_interval", float, "型号搜索和翻页的最短间隔（秒）"),
+    ("pacing", "search_max_per_10min", int, "任意连续十分钟内最多搜索多少次"),
     ("filter", "require_enough_stock", bool, "库存数量够需求的供应商优先"),
     ("filter", "only_today", bool, "只询价当天更新过库存的供应商"),
     ("filter", "max_pages", int, "最多翻几页搜索结果"),
@@ -115,7 +117,13 @@ def save_settings(data: dict) -> None:
             text = f"{float(val):g}"
         lines.append(f"# {desc}")
         lines.append(f"{key} = {text}")
-    SETTINGS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # 搜索进程会实时读取限速配置，保存时应只让它看到完整的旧版或新版。
+    temporary = SETTINGS_FILE.with_name(f"{SETTINGS_FILE.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        temporary.replace(SETTINGS_FILE)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def lock_held() -> bool:
@@ -614,7 +622,8 @@ def put_settings():
             return jsonify(error=f"「{key}」的值不对：{val}"), 400
         if typ in (int, float) and (not math.isfinite(val) or val < 0):
             return jsonify(error=f"「{key}」不能是负数"), 400
-        if key in {"target_quotes", "first_batch", "next_batch", "max_suppliers", "max_wait_minutes", "max_per_hour", "max_pages"} and val <= 0:
+        if key in {"target_quotes", "first_batch", "next_batch", "max_suppliers", "max_wait_minutes",
+                   "max_per_hour", "max_pages", "search_min_interval", "search_max_per_10min"} and val <= 0:
             return jsonify(error=f"「{key}」必须大于 0"), 400
         current.setdefault(sec, {})[key] = val
     try:

@@ -1,9 +1,9 @@
-import unittest
 from unittest.mock import Mock,patch
 from inquiry import icnet,qq
+from test_reliability import IsolatedTest
 
 
-class LaunchErrorTests(unittest.TestCase):
+class LaunchErrorTests(IsolatedTest):
     def test_tencent_refusal_is_terminal_and_other_web_pages_are_ignored(self):
         page=Mock(url="https://admin.qidian.qq.com/static_proxy/test")
         page.locator.return_value.inner_text.return_value="抱歉，无法发起临时会话。您可以先添加对方为好友，再发送消息"
