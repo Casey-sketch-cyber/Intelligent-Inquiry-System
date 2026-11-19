@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
-from . import db, icnet, incidents, llm, qq, report, workbench, dispatch
+from . import db, icnet, incidents, llm, qq, report, search_pacing, workbench, dispatch
 from .history import HistoryReadError, covers_previous, normalized
 from .identity import SendUncertainError, SupplierIdentityError, name_matches
 from .settings import DATA_DIR, ROOT, SETTINGS
@@ -97,6 +97,7 @@ class Runner:
             log(f"找不到名片图片 {self.card_image}，本次只发文字")
             self.card_image = None
         self.context = None
+        self.next_search = None
         self.page = None
         self.win = None
         self._stop = False
@@ -188,25 +189,27 @@ class Runner:
             return path
         with sync_playwright() as pw:
             _, context = browser_mod.connect(pw)
+            tabs = icnet.SearchTabs(context) if self.send_only or self.dry_run else None
+            if tabs is not None:
+                context = tabs
             self.context = context
             if not self.dry_run:
                 if not self.wait_for_qq():
                     return None
             self.make_tasks()
             try:
-                for t in self.tasks:
-                    if self.stop_requested():
-                        break
-                    if t.id not in self.resume and t.sent < int(self.cfg.get("max_suppliers", 30)):
-                        self.load_candidates(context, t)
                 if self.dry_run:
+                    self.run_dry_searches(tabs)
+                elif self.send_only:
+                    self.send_in_order(tabs)
+                else:
+                    cap = int(self.cfg.get("max_suppliers", 30))
                     for t in self.tasks:
-                        log(f"[试运行] {t.part_no} 可询价供应商 {len(t.candidates)} 家：")
-                        for r in list(t.candidates)[:20]:
-                            log(f"    {r['company']} | 库存 {r['qty']} | 批号 {r['batch']} | 日期 {r['date']} | QQ {','.join(q['uin'] for q in r['qqs'])}")
-                        db.finish_task(t.id, "stopped" if self.stop_requested() else "dry-run")
-                    return None
-                self.loop(context)
+                        if self.stop_requested():
+                            break
+                        if t.id not in self.resume and t.sent < cap:
+                            self.load_candidates(context, t)
+                    self.loop(context)
             except KeyboardInterrupt:
                 self._stop = True
                 log("立即退出")
@@ -215,14 +218,51 @@ class Runner:
                     if not t.done:
                         db.finish_task(t.id, "failed")
                 raise
+            finally:
+                self.next_search = None
+                if tabs is not None:
+                    tabs.close_all()
             if self._stop:
                 log("已停止询价，用已有数据出报告")
             for t in self.tasks:
                 if not t.done:
                     db.finish_task(t.id, "stopped")
+            if self.dry_run:
+                return None
             path = report.build([t.id for t in self.tasks])
             log(f"报告已生成：{path}")
             return path
+
+    def run_dry_searches(self, tabs):
+        for t in self.tasks:
+            if self.stop_requested():
+                break
+            self.load_candidates(tabs, t)
+            if not t.pages_loaded and self.stop_requested():
+                break
+            log(f"[试运行] {t.part_no} 可询价供应商 {len(t.candidates)} 家：")
+            for r in list(t.candidates)[:20]:
+                log(f"    {r['company']} | 库存 {r['qty']} | 批号 {r['batch']} | 日期 {r['date']} | QQ {','.join(q['uin'] for q in r['qqs'])}")
+            db.finish_task(t.id, "dry-run")
+            t.done = True
+            tabs.close(t.part_no)
+
+    def send_in_order(self, tabs):
+        for index, t in enumerate(self.tasks):
+            if self.stop_requested():
+                break
+            self.next_search = self.tasks[index + 1] if index + 1 < len(self.tasks) else None
+            while not self.stop_requested() and not self.check_done(t):
+                if not t.candidates:
+                    self.load_candidates(tabs, t)
+                    continue
+                row = t.candidates.popleft()
+                if self.inquire(t, row) is None:
+                    t.candidates.appendleft(row)
+                    # 保留此前等待 QQ 协助且不消耗报价时限的行为。
+                    t.started_at += 30
+                    self.idle(30)
+            tabs.close(t.part_no)
 
     def loop(self, context):
         while any(not t.done for t in self.tasks) and not self.stop_requested():
@@ -239,16 +279,17 @@ class Runner:
             self.idle(POLL_SECONDS, poll=False)
 
     # ---------- 供应商 ----------
-    def load_candidates(self, context, t: Task) -> bool:
+    def load_candidates(self, context, t: Task, *, wait=True) -> bool:
         max_pages = int(self.filter.get("max_pages", 3))
         if t.pages_loaded >= max_pages:
             return False
         page_no = t.pages_loaded + 1
         try:
-            self.page, rows = icnet.search(context, t.part_no, page_no, cancelled=self.stop_requested)
+            prefetch = {} if wait else {"wait": False, "source": "prefetch"}
+            self.page, rows = icnet.search(context, t.part_no, page_no, cancelled=self.stop_requested, **prefetch)
         except icnet.SearchCancelled:
             return False
-        except icnet.NotLoggedIn:
+        except (icnet.NotLoggedIn, search_pacing.SearchRateLimited):
             raise
         except Exception as e:
             t.pages_loaded = page_no
@@ -340,10 +381,11 @@ class Runner:
         if t.wave_remaining == 0:
             t.last_wave_at = time.time()
 
-    def wait_rate_limit(self) -> bool:
+    def wait_rate_limit(self, *, prefetch=False) -> bool:
         cap = int(self.pacing.get("max_per_hour", 60))
         if cap < 1:
             raise ValueError("每小时发送上限必须大于 0")
+        retry_search_at = 0.0
         while not self.stop_requested():
             now = time.time()
             while self.sent_times and now - self.sent_times[0] > 3600:
@@ -351,7 +393,17 @@ class Runner:
             delay = max(dispatch.rate_delay(self.pacing), self.next_send_at - now)
             if len(self.sent_times) < cap and delay <= 0:
                 return True
-            self.idle(min(30, max(1, delay)) if len(self.sent_times) < cap else 30)
+            wait = min(30, max(1, delay)) if len(self.sent_times) < cap else 30
+            if prefetch and self.next_search is not None and not self.next_search.pages_loaded:
+                if retry_search_at <= time.monotonic():
+                    try:
+                        self.load_candidates(self.context, self.next_search, wait=False)
+                    except search_pacing.SearchRateLimited as error:
+                        retry_search_at = time.monotonic() + error.retry_after
+                    else:
+                        continue
+                wait = min(wait, max(search_pacing.WAIT_STEP, retry_search_at - time.monotonic()))
+            self.idle(wait)
         return False
 
     def open_chat(self, t: Task, row: dict) -> str:
@@ -434,7 +486,12 @@ class Runner:
             if old.get("status") not in {"waiting_desktop", "waiting_search"}:
                 return False
             sid = old["id"]
-        if not self.wait_rate_limit():
+        try:
+            ready = self.wait_rate_limit(prefetch=True)
+        except icnet.NotLoggedIn as e:
+            db.update_supplier(sid, status="waiting_search", error=str(e))
+            raise
+        if not ready:
             db.update_supplier(sid, status="skipped", error="发送前收到停止请求")
             return False
         company = row["company"]
