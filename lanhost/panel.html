@@ -1,0 +1,59 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>双机工作台 · 天芯智能询价</title><link rel="icon" href="data:,">
+<style>*{box-sizing:border-box}body{margin:0;background:#f4f6fb;color:#12223e;font:15px/1.65 "Segoe UI","Microsoft YaHei",sans-serif}header{padding:18px 28px;background:#fff;border-bottom:1px solid #dde4ef;display:flex;align-items:center;gap:18px;flex-wrap:wrap}h1{font-size:21px;margin:0}button,.button{border:1px solid #d6dfec;background:white;color:#294776;border-radius:9px;padding:9px 15px;font:inherit;cursor:pointer}button.primary{background:#315ff5;color:white;border-color:#315ff5}button:disabled{opacity:.5;cursor:wait}.badge{color:#9a6700;background:#fff3d7;border-radius:15px;padding:3px 12px}.note{padding:10px 28px;margin:0;background:#edf2fd;color:#526986}#feedback{padding:0 28px;color:#b42318;white-space:pre-wrap}#welcome{max-width:800px;margin:46px auto;background:white;border:1px solid #dfe5ee;border-radius:18px;padding:30px}h2{font-size:22px;margin-top:0}.muted{color:#64738a}#buildResult{white-space:pre-wrap;overflow-wrap:anywhere}iframe{border:0;width:100%;height:calc(100vh - 150px);display:none}input[type=file]{max-width:100%;margin:8px 0 18px}.actions{display:flex;gap:12px;flex-wrap:wrap}details{margin-top:24px;padding-top:16px;border-top:1px solid #e6eaf0}#connectedTools{margin-left:auto;display:flex;gap:10px}</style>
+<header><h1>天芯 · 双机工作台</h1><span id="status">正在检查连接…</span><span class="badge" id="sendMode">正在检查实发模式…</span><div id="connectedTools"><button id="enableSending">开放常规实发</button><button id="collectReplies" class="primary">收集回复</button><button id="pauseCollectReplies" disabled>暂停收集回复</button><button id="resume" class="primary">恢复自动执行</button><button id="pause">暂停全部操作</button></div></header>
+<p class="note" id="note">办公电脑查看和管理任务，QQ 工作机执行操作。两台电脑都需保持开机联网。</p><p id="feedback" role="status"></p>
+<section id="connectionProblem" hidden style="margin:20px 28px;padding:18px 22px;background:#fff8e8;border:1px solid #eed7a5;border-radius:12px" role="status"><strong id="connectionTitle">正在重新连接 QQ 工作机</strong><p id="connectionDetail"></p><p>页面会自动重新检查连接。这里只重试连接状态，不会重新提交询价或发送消息。</p><button id="retryConnection">立即重连</button> <button id="changeConnection">更新连接文件</button></section>
+<main id="welcome" hidden><h2 id="welcomeTitle">连接你的 QQ 工作机</h2><ol id="setupInstructions"><li>将工作机安装包复制到第二台 Windows 电脑的 D 盘，解压并运行「1_安装QQ工作机.cmd」。</li><li>在工作机登录 QQ 和 IC交易网，按包内说明允许本局域网连接。</li><li>把工作机生成的「办公电脑连接.json」复制回本电脑，在下方导入。</li></ol><label for="connection">导入工作机连接文件</label><br><input id="connection" type="file" accept=".json,application/json"><button class="primary" id="import">验证并连接</button><p class="muted">文件包含本企业的配对凭据，请保存在 D 盘。工作机更换网络地址后，可在工作机更新连接文件并重新导入。</p>
+<details id="deployment"><summary>生成工作机安装包</summary><p>先在办公电脑生成安装包，再复制到本企业的第二台电脑。</p><label><input id="withData" type="checkbox"> 包含本机已有型号、设置和模型密钥（仅供本企业迁移）</label><p><button id="build">生成 D 盘部署包</button></p><p id="buildResult" class="muted"></p></details></main>
+<iframe id="workbench" title="双机询价工作台"></iframe>
+<script>
+let shown=false,busy=false,lastStatus=null,knownPaired=null,editingConnection=false,refreshing=null;
+const el=id=>document.getElementById(id);
+async function call(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});const value=await r.json();if(!r.ok)throw Error(value.error||'操作失败');return value}
+function renderConnection(s){
+  if(typeof s.paired==='boolean')knownPaired=s.paired;
+  if(s.online){knownPaired=true;editingConnection=false;lastStatus=s}
+  const online=!!s.online,mode=online?s:lastStatus;
+  el('status').textContent=online?(s.name+' · 已连接'):knownPaired?'工作机连接中断 · 自动重连中':s.text||'正在检查工作机连接';
+  el('sendMode').textContent=online?(s.trial_running?'授权真实测试中':s.allow_send?'常规实发已开放':'常规发送已锁定'):(mode?.allow_send?'常规实发已开放 · 连接待恢复':'实发状态待确认');
+  el('enableSending').hidden=!!mode?.allow_send;
+  el('enableSending').disabled=!online||!s.manual_ready||busy;
+  el('collectReplies').disabled=!online||busy||!!s.collection?.pending;
+  el('pauseCollectReplies').disabled=!online||busy||!s.collection?.pending;
+  el('resume').disabled=!online||busy||s.trial_running||s.manual&&!s.manual_ready;
+  el('pause').disabled=!online||busy;
+  el('note').textContent=online?(s.manual?(s.manual_ready?'全部自动操作已暂停。完成 QQ 和网站登录后，可在本机点「恢复自动执行」。':'正在停止操作，请等到已暂停后再处理登录。'):s.trial_running?'第二台正在执行限定测试。':s.running?(s.collection?.active?'正在第二台读取供应商回复；此操作不会重新发送询价。':'第二台正在执行任务。可在本机继续提交新批次，系统依次处理。'):(s.collection?.text||'等待任务')+'。在本机新建询价，第二台自动执行；点「收集回复」读取一轮，完成后停止。'):knownPaired?'已保存的连接文件仍在，连接恢复后继续使用当前页面。断线不代表工作机上的任务已停止，请先确认状态再提交。':'办公电脑管理任务，第二台操作 QQ。两台都需保持开机联网。';
+  el('connectionProblem').hidden=online||knownPaired===false;
+  el('connectionTitle').textContent=knownPaired?'QQ 工作机暂时无法连接，正在自动重连':'暂时无法检查工作机连接';
+  el('connectionDetail').textContent=s.error||'请检查第二台是否开机联网，QQ 工作机程序是否正在运行。';
+  el('changeConnection').hidden=knownPaired!==true;
+  el('welcome').hidden=knownPaired!==false&&!editingConnection;
+  el('welcomeTitle').textContent=knownPaired?'更新 QQ 工作机连接':'连接你的 QQ 工作机';
+  el('setupInstructions').hidden=knownPaired===true;
+  el('deployment').hidden=knownPaired===true;
+  if(online&&!shown){el('workbench').src='/workbench#/tasks';shown=true}
+  el('workbench').style.display=shown?'block':'none';
+  el('workbench').inert=!online;
+  el('workbench').style.opacity=online?'1':'.5';
+}
+function refresh(){
+  if(refreshing)return refreshing;
+  refreshing=(async()=>{const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),12000);try{
+    const r=await fetch('/api/lan/status',{signal:abort.signal,cache:'no-store'}),s=await r.json();
+    if(!r.ok)throw Error(s.error||'连接状态不可用');
+    renderConnection(s);
+  }catch(e){renderConnection({online:false,error:e.name==='AbortError'?'连接检查超时，正在重试；已保存的配对不会丢失。':e.message})}
+  finally{clearTimeout(timer);refreshing=null}})();
+  return refreshing;
+}
+async function action(fn){if(busy)return;busy=true;el('feedback').textContent='';try{await fn()}catch(e){el('feedback').textContent=e.message}finally{busy=false;await refresh()}}
+el('import').onclick=()=>action(async()=>{const f=el('connection').files[0];if(!f||f.size>65536)throw Error('请选择有效的工作机连接 JSON 文件');await call('/api/lan/import',JSON.parse(await f.text()));el('connection').value=''});
+el('retryConnection').onclick=()=>refresh();
+el('changeConnection').onclick=()=>{editingConnection=!editingConnection;el('welcome').hidden=!editingConnection};
+for(const name of ['pause','resume'])el(name).onclick=()=>action(()=>call('/api/lan/'+name));
+let collectRequest=null;el('collectReplies').onclick=()=>action(async()=>{collectRequest ||= crypto.randomUUID();await call('/api/collection',{action:'start',request_id:collectRequest});collectRequest=null});el('pauseCollectReplies').onclick=()=>action(()=>call('/api/collection',{action:'pause'}));
+el('enableSending').onclick=()=>action(async()=>{if(!confirm('开放后，在本机确认提交的询价及回复会由第二台真实发送。是否开放？'))return;await call('/api/lan/sending',{enabled:true})});
+el('build').onclick=()=>action(async()=>{el('build').disabled=true;el('buildResult').textContent='正在准备离线材料和校验清单，请稍候…';try{const r=await call('/api/lan/package',{with_data:el('withData').checked});el('buildResult').textContent='已生成：'+r.path+(r.private_migration?'\n含本企业私有配置和历史，请勿分发给其他客户。':'')}finally{el('build').disabled=false}});
+refresh();setInterval(()=>{if(!busy)refresh()},4000);
+</script></html>

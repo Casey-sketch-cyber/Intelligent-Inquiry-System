@@ -1,0 +1,28 @@
+# 复制为 settings.toml 后，在界面的「设置」中修改。
+[inquiry]
+template = "您好，料号：{part}，数量：{qty}pcs，要求全新原装，请报含税单价、交期、批次，谢谢。"
+card_image = ""
+send_card = false
+target_quotes = 5
+first_batch = 10
+next_batch = 5
+wave_wait_minutes = 15
+max_suppliers = 30
+max_wait_minutes = 90
+skip_recent_hours = 24
+
+[pacing]
+min_interval = 20
+max_interval = 45
+max_per_hour = 60
+
+[filter]
+require_enough_stock = true
+only_today = false
+max_pages = 3
+
+[llm]
+model = "deepseek-flash"
+
+[desktop]
+foreground_assist = false

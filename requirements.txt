@@ -1,0 +1,9 @@
+playwright
+python-dotenv
+openai
+uiautomation
+pywin32
+openpyxl
+pillow
+flask
+cryptography

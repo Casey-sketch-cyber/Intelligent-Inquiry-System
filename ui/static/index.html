@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>天芯智能询价系统</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Crect x='9' y='9' width='14' height='14' rx='3' fill='none' stroke='white' stroke-width='2.4'/%3E%3Cpath d='M13 5v4M19 5v4M13 23v4M19 23v4M5 13h4M5 19h4M23 13h4M23 19h4' stroke='white' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="brand-logo">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><rect x="6" y="6" width="12" height="12" rx="2.5"/><path d="M9.5 2.5v3M14.5 2.5v3M9.5 18.5v3M14.5 18.5v3M2.5 9.5h3M2.5 14.5h3M18.5 9.5h3M18.5 14.5h3"/><path d="M10 12h4M12 10v4" stroke-width="1.8"/></svg>
+      </div>
+      <div>
+        <div class="brand-name">天芯</div>
+        <div class="brand-sub">智能询价系统</div>
+      </div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-foot" id="sideFoot"></div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="pageTitle">工作台</h1>
+        <div class="sub" id="pageSub"></div>
+      </div>
+      <div class="spacer"></div>
+      <div class="pills" id="pills"></div>
+    </header>
+    <div class="collection-tools" id="collectionTools" role="region" aria-label="回复收集">
+      <div><b id="collectionStatus">等待手动收集回复</b><div class="small muted">只在点击后收集一轮，完成即停止，不自动核对。</div></div>
+      <button class="btn btn-primary" id="collectReplies">收集回复</button>
+      <button class="btn" id="pauseCollectReplies" disabled>暂停收集回复</button>
+    </div>
+    <section class="content" id="view"></section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="/static/app.js?v=20261022-manual-collection"></script>
+  <script src="/static/workbench.js?v=20261023-reply-body"></script>
+</body>
+</html>

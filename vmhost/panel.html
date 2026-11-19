@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>独立运行环境 · 天芯智能询价</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f6fb;color:#12223e;font:15px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}
+header{padding:20px 28px;background:white;border-bottom:1px solid #dde4ef;display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+h1{font-size:20px;margin:0}button,a.button{border:1px solid #d5dfed;background:white;color:#294776;border-radius:10px;padding:10px 16px;font:inherit;cursor:pointer;text-decoration:none}
+button:first-of-type{background:#315ff5;color:white;border-color:#315ff5}button:disabled{opacity:.5;cursor:wait}
+#note{margin:0;padding:12px 28px;color:#556784;background:#edf2fd}#feedback{margin:0;padding:0 28px;color:#b42318;white-space:pre-wrap}
+.welcome{max-width:750px;margin:65px auto;padding:32px;background:white;border:1px solid #e1e7f0;border-radius:18px}
+iframe{border:0;width:100%;height:calc(100vh - 160px);display:none}#status{color:#536680}small{color:#60728d}
+</style>
+<header><h1>天芯 · 独立运行环境</h1><span id="status">正在检查…</span>
+<button data-action="start">启动运行环境</button><button data-action="show">查看登录窗口</button>
+<button data-action="shutdown">停止询价并关机</button></header>
+<p id="note">QQ 在独立环境中操作。正常关机后释放运行资源；仅关闭本页面不会关闭运行环境。</p>
+<p id="feedback" role="status"></p>
+<div class="welcome" id="welcome"><h2>准备运行环境</h2><p id="detail">正在检查安装和连接状态。</p>
+<ol><li>准备 Windows x64 安装镜像，并在运行窗口中完成系统安装。</li>
+<li>Windows 安装完成后，点击下方按钮挂载辅助组件，在虚拟机光驱中运行安装程序并重启。</li>
+<li>在虚拟机中打开 <code>\\VBOXSVR\TianxinSetup</code>，以管理员身份运行 <code>InstallGuest.cmd</code>。</li>
+<li>在虚拟机中安装 QQ 并由你本人登录。连接成功后，本页自动显示询价工作台。</li></ol>
+<button data-action="mount-tools">Windows 已装好，挂载辅助组件</button>
+<p><small>默认只读验收，不发送消息。完成登录后分离窗口，保留虚拟机运行，再点「启动运行环境」恢复自动操作。虚拟机内的 Windows 必须保持登录。请勿在办公电脑上运行来宾初始化程序。</small></p></div>
+<iframe id="workbench" title="询价工作台"></iframe>
+<script>
+const names={not_created:"尚未安装",unavailable:"需要处理",poweroff:"已关机 · 运行资源已释放",running:"运行中",saved:"已保存状态",paused:"已暂停 · 内存仍占用",aborted:"意外停止",stopping:"正在关机"};
+let loading=false,shown=false;
+async function refresh(){
+ try{const r=await fetch('/api/vm/status'); const s=await r.json();
+ document.querySelector('#status').textContent=names[s.vm.state]||s.vm.state;
+ document.querySelector('#detail').textContent=s.vm.text||s.connection.text||"请启动运行环境，然后完成登录。";
+ const online=s.connection.online&&s.vm.state==='running'&&!s.connection.shutdown_ready;
+ document.querySelector('#note').textContent=online?(s.connection.allow_send?"运行环境已连接。QQ 操作在内部执行。":"只读验收模式：可以查看和补收；真实询价和回复发送均已锁定。"):"正常关机后释放运行资源；仅关闭本页面不会关闭运行环境。";
+ if(online&&s.connection.manual)document.querySelector('#note').textContent="人工登录中，自动操作已暂停。完成后分离登录窗口，再点「启动运行环境」恢复后台运行。真实发送限制保持不变。";
+ if(online&&!shown){document.querySelector('#workbench').src='/workbench#/tasks';shown=true}
+ document.querySelector('#workbench').style.display=online?'block':'none';
+ document.querySelector('#welcome').style.display=online?'none':'block';
+ }catch(e){document.querySelector('#feedback').textContent="暂时无法读取运行状态"}
+}
+for(const b of document.querySelectorAll('button'))b.onclick=async()=>{
+ if(loading)return;loading=true;document.querySelectorAll('button').forEach(x=>x.disabled=true);
+ document.querySelector('#feedback').textContent="";
+ try{const r=await fetch('/api/vm/'+b.dataset.action,{method:'POST'});const s=await r.json();if(!r.ok)throw Error(s.error||"操作失败");document.querySelector('#feedback').textContent=s.text||"";await refresh()}
+ catch(e){document.querySelector('#feedback').textContent=e.message}
+ finally{loading=false;document.querySelectorAll('button').forEach(x=>x.disabled=false)}
+};
+refresh();setInterval(refresh,3000);
+</script></html>
