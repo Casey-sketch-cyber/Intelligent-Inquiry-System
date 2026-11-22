@@ -232,20 +232,24 @@ def _search_row_without_links(row: dict) -> dict:
     return row
 
 
-def read_search_cache(part_no: str, page_no: int, *, cutoff: float, now: float) -> tuple[list[dict], float | None, float] | None:
+def read_search_cache_pages(
+    part_no: str, first_page: int, last_page: int, *, cutoff: float, now: float,
+) -> dict[int, tuple[list[dict], float | None, float]]:
     with connect() as c:
-        row = c.execute(
-            "SELECT rows_json, ref_price, fetched_at FROM search_cache WHERE part_no=? AND page_no=? "
-            "AND fetched_at>? AND fetched_at<=?", (part_no, page_no, cutoff, now),
-        ).fetchone()
-    if row:
+        records = c.execute(
+            "SELECT page_no, rows_json, ref_price, fetched_at FROM search_cache "
+            "WHERE part_no=? AND page_no BETWEEN ? AND ? AND fetched_at>? AND fetched_at<=?",
+            (part_no, first_page, last_page, cutoff, now),
+        ).fetchall()
+    pages = {}
+    for row in records:
         try:
             rows = json.loads(row["rows_json"])
         except ValueError:
-            return None
+            continue
         if isinstance(rows, list) and all(isinstance(item, dict) for item in rows):
-            return rows, row["ref_price"], row["fetched_at"]
-    return None
+            pages[row["page_no"]] = (rows, row["ref_price"], row["fetched_at"])
+    return pages
 
 
 def save_search_cache(part_no: str, page_no: int, rows: list[dict], price: float | None, fetched_at: float):
