@@ -9,7 +9,82 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from inquiry import db, incidents, llm, qq, runtime, workbench
 from ui import server, service
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
+
+
+def verify_selfcheck_status(browser, base, output):
+    page = browser.new_page(viewport={"width": 1440, "height": 1000})
+    pending_job, login_job = "a" * 32, "b" * 32
+    overview = {
+        "today": "2026-11-22",
+        "run": {"running": False, "stopping": False},
+        "env": {key: {"ok": True, "text": "模拟"} for key in ("qq", "browser", "deepseek", "card")},
+        "runtime": {"dedicated_worker": True, "allow_send": True},
+        "stats": {"sent_today": 0, "replied_today": 0, "valid_today": 0},
+        "tasks": [{"id": 42, "part_no": "TEST-QQ", "qty": 5000, "status": "waiting_selfcheck",
+                   "status_cn": "等待 QQ 自检", "created_at": 1_795_000_000, "target": 5,
+                   "valid": 0, "sent": 0, "replied": 0}],
+        "jobs": [{"id": pending_job, "task_ids": [42], "status": "waiting_selfcheck", "dry_run": False},
+                 {"id": login_job, "task_ids": [43], "status": "waiting_member_login", "dry_run": True}],
+    }
+    errors, submission, cancelled = [], [], []
+    page.on("pageerror", lambda err: errors.append(str(err)))
+    page.route("**/api/overview", lambda route: route.fulfill(json=overview))
+    page.route("**/api/settings", lambda route: route.fulfill(json={
+        "settings": {"inquiry": {"template": "{part} {qty}"}}, "schema": [],
+    }))
+
+    def reject_run(route):
+        submission.append(route.request.post_data_json)
+        route.fulfill(status=400, json={"error": "离线测试不接受新任务"})
+
+    def cancel(route):
+        cancelled.append(route.request.url)
+        overview["jobs"][0]["status"] = "stopped"
+        route.fulfill(json={"ok": True})
+
+    page.route("**/api/run", reject_run)
+    page.route("**/api/jobs/*/cancel", cancel)
+    try:
+        page.goto(base + "#/")
+        expect(page.get_by_role("heading", name="执行批次")).to_be_visible()
+        notice = page.locator("#selfcheckStatus")
+        expect(notice).to_be_hidden()
+        overview["selfcheck"] = None
+        page.evaluate("refreshOverview()")
+        expect(notice).to_have_text("等待 QQ 控件自检")
+        overview["selfcheck"] = {
+            "ok": False, "missing": ["editor", "send_button"], "qq_version": "9.9.1.0",
+            "edge_version": "140.0.0.0", "text": "QQ 控件未就绪", "checked_at": 1_795_000_000,
+        }
+        page.evaluate("refreshOverview()")
+        expect(notice).to_contain_text("QQ 版本 9.9.1.0 · Edge 版本 140.0.0.0")
+        expect(notice).to_contain_text("缺少 输入框、发送按钮")
+        expect(page.locator(".task-row .chip.amber")).to_have_text("等待 QQ 自检")
+        expect(page.get_by_text("任务 #43 · 等待网站登录")).to_be_visible()
+        expect(page.locator(f'[data-cancel-job="{login_job}"]')).to_be_visible()
+        page.screenshot(path=str(output / "qq-selfcheck.png"), full_page=True, animations="disabled")
+        page.locator(f'[data-cancel-job="{pending_job}"]').click()
+        expect(page.get_by_text("任务 #42 · 已停止")).to_be_visible()
+        assert len(cancelled) == 1 and cancelled[0].endswith(f"/api/jobs/{pending_job}/cancel")
+        page.get_by_role("link", name="新建询价").first.click()
+        expect(page.locator("#checklist")).to_contain_text("缺少 输入框、发送按钮")
+        expect(page.locator("#dryRun")).not_to_be_checked()
+        expect(page.locator("#btnStart")).to_be_disabled()
+        page.locator("#dryRun").locator("..").click()
+        expect(page.locator("#btnStart")).to_be_enabled()
+        overview["selfcheck"] = None
+        page.evaluate("refreshOverview()")
+        expect(page.locator("#btnStart")).to_be_enabled()
+        page.locator("#dryRun").locator("..").click()
+        expect(page.locator("#btnStart")).to_be_disabled()
+        overview["selfcheck"] = {"ok": True, "missing": [], "text": "QQ 自检通过"}
+        page.evaluate("refreshOverview()")
+        expect(notice).to_contain_text("QQ 自检通过")
+        expect(page.locator("#btnStart")).to_be_enabled()
+        assert not submission and not errors, (submission, errors)
+    finally:
+        page.close()
 
 
 def main():
@@ -159,8 +234,9 @@ def main():
                     assert server.load_settings()["filter"]["search_cache_hours"] == 0
                     page.screenshot(path=str(output / "settings.png"), full_page=True)
                     assert not errors, errors
+                    verify_selfcheck_status(browser, base, output)
                     browser.close()
-                print("UI smoke passed: model grouping/search, suggestion edit/rejection, runtime incident summaries, batch preview, card toggle and cache controls.")
+                print("UI smoke passed: model grouping/search, reply suggestions, incidents, batch previews, settings, and QQ selfcheck.")
                 print("No real QQ sends or model calls. Screenshots:", output)
             finally:
                 httpd.shutdown()

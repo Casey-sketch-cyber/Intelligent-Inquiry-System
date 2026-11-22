@@ -62,7 +62,9 @@ def no_stale_ui(response):
 STATUS_CN = {"pending": "未询价", "sent": "已发送", "quoted": "已报价", "no_stock": "无货", "asking": "对方反问",
              "failed": "失败", "skipped": "跳过", "identity_unverified": "身份待核实（未发送）", "parse_pending": "回复已保存·待解析", "send_uncertain": "发送结果待核实", "waiting_desktop": "等待 QQ 协助（未发送）", "waiting_search": "等待网站搜索（未发送）"}
 TASK_STATUS_CN = {"running": "进行中", "done": "已结束", "stopped": "已停止", "dry-run": "试运行",
-                  "needs_review": "已结束·待补收", "failed": "运行异常", "queued": "等待工作机执行", "waiting_verification": "等待网站人工校验"}
+                  "needs_review": "已结束·待补收", "failed": "运行异常", "queued": "等待工作机执行",
+                  "waiting_verification": "等待网站人工校验", "waiting_member_login": "等待网站登录",
+                  "waiting_selfcheck": "等待 QQ 自检"}
 
 # 设置项：(分组, 键, 类型, 说明)。写回 settings.toml 时按这个顺序、带中文注释
 SETTINGS_SCHEMA = [
@@ -302,12 +304,13 @@ def overview():
         replied_today = c.execute("SELECT COUNT(*) FROM supplier WHERE last_reply_at >= ?", (since,)).fetchone()[0]
         valid_today = c.execute("SELECT COUNT(*) FROM quote WHERE valid = 1 AND updated_at >= ?", (since,)).fetchone()[0]
     from inquiry import isolation
-    from inquiry import collection, jobs
+    from inquiry import collection, jobs, selfcheck
     return jsonify(app_name=APP_NAME, today=today, run=run_state(), env=env_status(), tasks=tasks, observer=observer.STATE,
                    runtime={"virtual_machine": isolation.ENABLED and isolation.MODE != "worker",
                             "dedicated_worker": isolation.ENABLED and isolation.MODE == "worker",
                             "allow_send": isolation.ALLOW_SEND if isolation.ENABLED else True},
                    collection=collection.status(), jobs=jobs.recent() if isolation.MODE == "worker" else [],
+                   **({"selfcheck": selfcheck.latest()} if isolation.MODE == "worker" else {}),
                    stats={"sent_today": sent_today, "replied_today": replied_today, "valid_today": valid_today})
 
 

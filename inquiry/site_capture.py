@@ -29,15 +29,25 @@ STATUSES = {
 }
 
 
-def page_kind(url: str) -> str | None:
-    """只识别允许展示和手动操作的登录、校验地址。"""
+def _site_address(url: str):
     if not isinstance(url, str) or re.search(r"[\s\x00-\x1f\x7f\\]", url):
         return None
     try:
         address = urlsplit(url)
     except ValueError:
         return None
-    if address.scheme != "https":
+    return address if address.scheme == "https" else None
+
+
+def is_member_portal(url: str) -> bool:
+    address = _site_address(url)
+    return address is not None and address.netloc.lower() == "member.ic.net.cn"
+
+
+def page_kind(url: str) -> str | None:
+    """只识别允许展示和手动操作的登录、校验地址。"""
+    address = _site_address(url)
+    if address is None:
         return None
     host = address.netloc.lower()
     if host == "member.ic.net.cn":
@@ -88,7 +98,10 @@ def inspect_browser() -> tuple[dict, str | None]:
             if page_kind(target.get("url")) == kind:
                 target_id = target.get("id")
                 return STATUSES[kind].copy(), target_id if _valid_id(target_id) else None
-    return STATUSES["ok"].copy(), None
+    ready = STATUSES["ok"].copy()
+    if any(is_member_portal(target.get("url")) for target in targets):
+        ready["member_portal_open"] = True
+    return ready, None
 
 
 def _socket_url() -> str | None:

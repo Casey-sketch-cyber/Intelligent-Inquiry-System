@@ -170,8 +170,13 @@ class Runner:
 
     # ---------- 入口 ----------
     def run(self) -> str | None:
+        from . import isolation, selfcheck
+
         if self.parts and not self.resume and not self.collect:
             self.send_only = True
+        if (isolation.ENABLED and isolation.MODE == "worker" and self.send_only
+                and not self.dry_run and not self.collect):
+            selfcheck.require_ready()
         if not self.send_only:
             STOP_FILE.unlink(missing_ok=True)  # 队列任务保留启动期间收到的暂停请求。
         signal.signal(signal.SIGINT, self._on_sigint)

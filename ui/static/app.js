@@ -80,12 +80,32 @@ const parseQty = (s) => {
 };
 const renderMsg = (tpl, part, qty) => (tpl || "").replace(/\{part\}/g, part).replace(/\{qtyk\}/g, fmtQty(qty)).replace(/\{qty\}/g, qty);
 
-const TASK_CHIP = { running: "blue", done: "green", stopped: "amber", "dry-run": "", needs_review: "amber", failed: "red", queued:"blue", waiting_verification:"amber" };
+const TASK_CHIP = { running: "blue", done: "green", stopped: "amber", "dry-run": "", needs_review: "amber", failed: "red", queued:"blue", waiting_verification:"amber", waiting_member_login:"amber", waiting_selfcheck:"amber" };
 const SUP_CHIP = { quoted: "green", sent: "blue", asking: "amber", failed: "red", no_stock: "", skipped: "", pending: "", waiting_desktop: "amber", identity_unverified: "amber", parse_pending: "amber", send_uncertain: "amber" };
 const chip = (text, cls = "") => `<span class="chip ${cls}">${esc(text)}</span>`;
 const taskChip = (t) => chip(t.status_cn, TASK_CHIP[t.status] ?? "");
 const bar = (v, max) => `<div class="bar ${v >= max ? "done" : ""}"><i style="width:${Math.min(100, max ? (v / max) * 100 : 0)}%"></i></div>`;
 const empty = (msg, ic = "list") => `<div class="empty">${icon(ic, 36)}<div>${esc(msg)}</div></div>`;
+const SELF_CHECK_CONTROLS = {
+  qq_window: "QQ 主窗口",
+  conversation_list: "会话列表",
+  message_list: "聊天记录列表",
+  editor: "输入框",
+  send_button: "发送按钮",
+};
+
+function hasSelfcheck(overview) {
+  return overview.selfcheck != null ||
+    (overview.runtime?.dedicated_worker === true && Object.hasOwn(overview, "selfcheck"));
+}
+
+function selfcheckDescription(check) {
+  if (!check) return "等待 QQ 控件自检";
+  const status = check.text || (check.ok ? "QQ 控件自检通过" : "QQ 控件未就绪");
+  const missing = (Array.isArray(check.missing) ? check.missing : []).map(key => SELF_CHECK_CONTROLS[key])
+    .filter(name => typeof name === "string" && !status.includes(name));
+  return missing.length ? `${status} · 缺少 ${missing.join("、")}` : status;
+}
 
 // ---------- 外框：导航、状态 ----------
 function renderNav() {
@@ -110,6 +130,13 @@ function renderChrome() {
   $("#pills").innerHTML =
     pill(e.qq.ok, "QQ", e.qq.text) + pill(e.browser.ok, "IC交易网", e.browser.text) + pill(e.deepseek.ok, "DeepSeek", e.deepseek.text) +
     `<span class="pill"><span class="dot ${run.running ? "run" : "ok"}"></span>${ov.collection?.active ? "正在读取回复" : run.running ? (run.stopping ? "正在停止…" : run.waiting_reason ? "等待 QQ 协助" : "运行中") : esc(ov.collection?.text || "空闲")}</span>`;
+  const selfcheck = $("#selfcheckStatus");
+  const description = hasSelfcheck(ov) ? selfcheckDescription(ov.selfcheck) : "";
+  const text = ov.selfcheck ? `QQ 版本 ${ov.selfcheck.qq_version || "未识别"} · Edge 版本 ${ov.selfcheck.edge_version || "未识别"} · ${description}` : description;
+  if (selfcheck) {
+    if (selfcheck.textContent !== text) selfcheck.textContent = text;
+    selfcheck.hidden = !text;
+  }
   $("#sideFoot").innerHTML = run.running
     ? `<div class="run"><span class="dot run"></span>${run.stopping ? "正在安全停止" : { run: "正在询价", collect: "正在补收回复", reply: "正在发送回复", "dry-run": "试运行中" }[run.kind] || "运行中"}</div><div class="hint">${esc(run.label || "")}</div>`
     : `<div class="run"><span class="dot ok"></span>系统空闲</div><div class="hint">${esc(ov.observer?.text || `今天 ${ov.today}`)}</div>`;
@@ -134,6 +161,8 @@ async function refreshOverview() {
     S.ov = await api("/api/overview");
   } catch (e) {
     $("#pills").innerHTML = `<span class="pill"><span class="dot bad"></span>与后台服务断开，请重新打开界面</span>`;
+    const selfcheck = $("#selfcheckStatus");
+    if (selfcheck) selfcheck.hidden = true;
     return;
   }
   renderChrome();
@@ -187,7 +216,7 @@ function renderDashboard(force = false) {
     : empty("还没有询价任务，点「新建询价」开始第一轮", "list");
   view.innerHTML = `
     ${hero}${lastErr}
-    ${(ov.jobs || []).length ? `<div class="card mt" style="padding:18px"><h3>执行批次</h3>${ov.jobs.map(j=>`<div class="row wrap between" style="padding:8px 0"><span>${j.dry_run?"试运行 ":""}任务 ${j.task_ids.map(id=>'#'+id).join('、')} · ${esc(({queued:'已排队',running:'正在执行',done:j.dry_run?'搜索已完成':'发信已完成',waiting_verification:'等待网站人工校验',stopped:'已停止',interrupted:'中断待核对',failed:'执行异常'})[j.status]||j.status)}${j.error?`<br><span class="small muted">${esc(j.error)}</span>`:''}</span><span>${['queued','waiting_verification','interrupted','failed'].includes(j.status)?`<button class="btn btn-sm" data-cancel-job="${esc(j.id)}">取消此批次</button>`:''}${['interrupted','stopped','failed'].includes(j.status)?`<button class="btn btn-sm" data-resume-job="${esc(j.id)}">继续未完成部分</button>`:''}</span></div>`).join('')}</div>`:''}
+    ${(ov.jobs || []).length ? `<div class="card mt" style="padding:18px"><h3>执行批次</h3>${ov.jobs.map(j=>`<div class="row wrap between" style="padding:8px 0"><span>${j.dry_run?"试运行 ":""}任务 ${j.task_ids.map(id=>'#'+id).join('、')} · ${esc(({queued:'已排队',running:'正在执行',done:j.dry_run?'搜索已完成':'发信已完成',waiting_verification:'等待网站人工校验',waiting_member_login:'等待网站登录',waiting_selfcheck:'等待 QQ 控件自检',stopped:'已停止',interrupted:'中断待核对',failed:'执行异常'})[j.status]||j.status)}${j.error?`<br><span class="small muted">${esc(j.error)}</span>`:''}</span><span>${['queued','waiting_verification','waiting_member_login','waiting_selfcheck','interrupted','failed'].includes(j.status)?`<button class="btn btn-sm" data-cancel-job="${esc(j.id)}">取消此批次</button>`:''}${['interrupted','stopped','failed'].includes(j.status)?`<button class="btn btn-sm" data-resume-job="${esc(j.id)}">继续未完成部分</button>`:''}</span></div>`).join('')}</div>`:''}
     <div class="grid g4 mt">
       ${envCard("chat", "QQ", e.qq, e.qq.ok ? `<div class="small muted env-act">请保持登录，主窗口别关</div>` : `<div class="small muted env-act">请登录 QQ 并打开主窗口</div>`)}
       ${envCard("globe", "IC交易网", e.browser, browserAct)}
@@ -374,13 +403,16 @@ function updateNewPageState() {
   }
   if (!ov || !list || !btn) return;
   const e = ov.env;
+  const checkKnown = hasSelfcheck(ov);
+  const qqReady = !checkKnown || ov.selfcheck?.ok === true;
   const item = (ok, text, hint) => `<div class="row"><span style="color:${ok ? "#22c55e" : "#ef4444"}">${icon(ok ? "check" : "x")}</span><div><div>${text}</div>${!ok && hint ? `<div class="small muted">${hint}</div>` : ""}</div></div>`;
   list.innerHTML = item(e.qq.ok, "QQ 已登录、主窗口已打开", "请先登录 QQ 并打开主窗口")
+    + (!S.dryRun && checkKnown ? item(qqReady, "QQ 控件自检", esc(selfcheckDescription(ov.selfcheck))) : "")
     + item(e.browser.ok, "IC交易网", e.browser.code === "closed" ? "专用浏览器没开，开始询价时会自动打开；第一次需要扫码登录" : e.browser.code==='verification' ? "第二台需要人工完成网站校验" : "请在第二台的专用浏览器里扫码登录")
     + item(e.deepseek.ok, "DeepSeek 已配置", "请在项目文件夹的 .env 里填写 DEEPSEEK_API_KEY")
     + item(ov.runtime?.dedicated_worker || !ov.run.running, ov.runtime?.dedicated_worker ? "任务由第二台依次自动执行" : "没有其他询价在运行", "请等当前运行结束，或先安全停止")
     + (e.browser.code==='verification' ? '<div class="notice">第二台的网站需要人工完成验证码。提交后会保留任务并等待，不会反复搜索。</div>' : '');
-  btn.disabled = S.submitting || (!ov.runtime?.dedicated_worker && ov.run.running) || (!S.dryRun && (!e.qq.ok || !ov.runtime?.allow_send));
+  btn.disabled = S.submitting || (!ov.runtime?.dedicated_worker && ov.run.running) || (!S.dryRun && (!e.qq.ok || !qqReady || !ov.runtime?.allow_send));
   btn.innerHTML = S.submitting ? '正在提交…' : `${icon("play")}${S.dryRun ? "开始试运行" : ov.runtime?.dedicated_worker ? "提交并由第二台询价" : "开始询价"}`;
 }
 
