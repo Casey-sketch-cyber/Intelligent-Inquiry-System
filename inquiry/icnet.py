@@ -45,24 +45,66 @@ def parse_qty(s: str) -> int:
     return int(n * {"K": 1000, "W": 10000, "万": 10000}.get(m.group(2), 1))
 
 
-def search_page(context: BrowserContext, part_no=None) -> Page:
-    """常用型号各复用一个结果页，减少批量轮询时反复加载；仍重新核对供应商行。"""
-    searches = []
-    for pg in context.pages:
-        parsed = urlparse(pg.url)
-        if parsed.hostname in ("www.ic.net.cn", "ic.net.cn") and parsed.path.startswith("/search/"):
-            searches.append(pg)
-            actual = unquote(parsed.path.removeprefix("/search/").removesuffix(".html"))
-            if not part_no or actual.upper() == part_no.strip().upper():
-                return pg
-        if not part_no and "member.ic.net.cn/login" in pg.url:
-            return pg
-    if len(searches) >= 20:
-        return searches[0]
-    return context.new_page()
+def _result_part(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.hostname in ("www.ic.net.cn", "ic.net.cn") and parsed.path.startswith("/search/"):
+        return unquote(parsed.path.removeprefix("/search/").removesuffix(".html")).strip().upper()
+    return None
 
 
-def search(context: BrowserContext, part_no: str, page_no: int = 1, *,
+class SearchTabs:
+    """记录当前批次打开的搜索页，保留其他标签和需要人工处理的页面。"""
+
+    def __init__(self, context: BrowserContext):
+        self.context = context
+        self._opened = {}
+
+    @property
+    def pages(self):
+        return self.context.pages
+
+    @staticmethod
+    def _is_owned_result(page: Page, part: str) -> bool:
+        return not page.is_closed() and (page.url == "about:blank" or _result_part(page.url) == part)
+
+    def existing(self, part_no: str) -> Page | None:
+        part = part_no.strip().upper()
+        page = self._opened.get(part)
+        return page if page is not None and self._is_owned_result(page, part) else None
+
+    def open(self, part_no: str) -> Page:
+        part = part_no.strip().upper()
+        page = self.existing(part)
+        if page is None:
+            page = self.context.new_page()
+            self._opened[part] = page
+        return page
+
+    def close(self, part_no: str) -> None:
+        part = part_no.strip().upper()
+        page = self._opened.pop(part, None)
+        if page is not None and self._is_owned_result(page, part):
+            close_quietly(page)
+
+    def close_all(self) -> None:
+        for part in tuple(self._opened):
+            self.close(part)
+
+
+def _existing_search_page(context: BrowserContext | SearchTabs, part_no: str) -> Page | None:
+    if isinstance(context, SearchTabs):
+        return context.existing(part_no)
+    part = part_no.strip().upper()
+    return next((page for page in context.pages if _result_part(page.url) == part), None)
+
+
+def search_page(context: BrowserContext | SearchTabs, part_no: str) -> Page:
+    if isinstance(context, SearchTabs):
+        return context.open(part_no)
+    return _existing_search_page(context, part_no) or context.new_page()
+
+
+def search(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1, *,
            cancelled=lambda: False, source="candidates", wait=True) -> tuple[Page, list[dict]]:
     def check():
         if cancelled():
@@ -128,13 +170,13 @@ def _same_supplier(a: dict, b: dict) -> bool:
     return a["company"] == b["company"] and bool({q["uin"] for q in a["qqs"]} & {q["uin"] for q in b["qqs"]})
 
 
-def find_row(context: BrowserContext, part_no: str, row: dict, max_pages: int = 3, *,
+def find_row(context: BrowserContext | SearchTabs, part_no: str, row: dict, max_pages: int = 3, *,
              cancelled=lambda: False, source="supplier_lookup", wait=True) -> tuple[Page, dict] | None:
-    """重新在页面上找到这家供应商当前所在的行（网站每次加载排序都会变，多个型号还共用一个标签页）。"""
+    """在当前型号的搜索结果中核对供应商行，找不到时按限速翻页。"""
     if cancelled():
         raise SearchCancelled("已停止定位 IC交易网供应商")
-    page = search_page(context, part_no)
-    if norm_part(part_no) in norm_part(page.url) and "/search/" in page.url:
+    page = _existing_search_page(context, part_no)
+    if page is not None and _result_part(page.url) == part_no.strip().upper():
         hit = next((r for r in page.evaluate(EXTRACT_JS) if _same_supplier(r, row)), None)
         if hit:
             return page, {**row, "index": hit["index"]}

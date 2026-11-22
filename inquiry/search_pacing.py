@@ -11,7 +11,11 @@ WAIT_STEP = 0.25
 
 
 class SearchRateLimited(ValueError):
-    """同步诊断不等待长时间搜索额度，提示稍后手动重试。"""
+    """本次搜索没有额度，调用方可以在任意主流程间隙重试。"""
+
+    def __init__(self, message, *, retry_after):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def _limits():
@@ -55,7 +59,7 @@ def wait_for_search(part_no, page_no, source, check, *, wait=True):
         if delay <= 0:
             return
         if not wait:
-            raise SearchRateLimited("IC交易网搜索正在限速，请稍后重试这项诊断")
+            raise SearchRateLimited("IC交易网搜索正在限速，请稍后重试这项诊断", retry_after=delay)
         deadline = time.monotonic() + delay
         while (remaining := deadline - time.monotonic()) > 0:
             check()

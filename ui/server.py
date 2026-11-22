@@ -506,7 +506,7 @@ def cancel_job(jid):
 @app.post("/api/jobs/<jid>/resume")
 def resume_job(jid):
     from inquiry import jobs, isolation
-    if not isolation.ALLOW_SEND:
+    if not isolation.ALLOW_SEND and jobs.get(jid)["dry_run"] is not True:
         return jsonify(error="常规实发尚未开启"), 423
     jobs.resume(jid)
     return jsonify(ok=True)
