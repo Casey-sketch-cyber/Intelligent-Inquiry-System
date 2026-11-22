@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlpars
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 
-from . import incidents, search_pacing
+from . import incidents, search_pacing, site_capture
 from .settings import DATA_DIR
 
 SEARCH_URL = "https://www.ic.net.cn/search/{part}.html"
@@ -126,8 +126,11 @@ def search_page(context: BrowserContext | SearchTabs, part_no: str, page_no: int
     return _existing_search_page(context, part_no) or context.new_page()
 
 
-def _require_no_captcha(context: BrowserContext | SearchTabs) -> None:
-    if any(urlparse(p.url).path == "/searchPnCode.php" for p in context.pages):
+def _raise_search_block(kind: str | None) -> None:
+    if kind == "login":
+        incidents.record("login_required", "search", severity="warning")
+        raise NotLoggedIn("IC交易网仍有登录页，请在专用浏览器完成登录后继续")
+    if kind == "verification":
         incidents.record("captcha", "search", severity="warning")
         raise NotLoggedIn("IC交易网仍在等待网站校验，请人工完成后继续；没有重新发送搜索请求")
 
@@ -135,19 +138,17 @@ def _require_no_captcha(context: BrowserContext | SearchTabs) -> None:
 def check_search_session(context: BrowserContext | SearchTabs, *, cancelled=lambda: False):
     if cancelled():
         raise SearchCancelled("已停止等待 IC交易网搜索")
-    _require_no_captcha(context)
-    if any(urlparse(page.url).hostname == "member.ic.net.cn" and urlparse(page.url).path.startswith("/login")
-           for page in context.pages):
-        incidents.record("login_required", "search", severity="warning")
-        raise NotLoggedIn("IC交易网仍有登录页，请在专用浏览器完成登录后继续")
+    kinds = {site_capture.page_kind(page.url) for page in context.pages}
+    if "login" in kinds:
+        _raise_search_block("login")
+    if "verification" in kinds:
+        _raise_search_block("verification")
 
 
 def search(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1, *,
            cancelled=lambda: False, source="candidates", wait=True) -> tuple[Page, list[dict]]:
     def check():
-        if cancelled():
-            raise SearchCancelled("已停止等待 IC交易网搜索")
-        _require_no_captcha(context)
+        check_search_session(context, cancelled=cancelled)
 
     check()
     url = SEARCH_URL.format(part=quote(part_no.strip(), safe="")) + (f"?page={int(page_no)}" if page_no > 1 else "")
@@ -155,12 +156,7 @@ def search(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1,
     check()
     page = search_page(context, part_no, page_no)
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    if "member.ic.net.cn/login" in page.url:
-        incidents.record("login_required", "search", severity="warning")
-        raise NotLoggedIn("IC交易网没有登录，请在系统打开的 Edge 窗口里扫码登录")
-    if urlparse(page.url).path == "/searchPnCode.php":
-        incidents.record("captcha", "search", severity="warning")
-        raise NotLoggedIn("IC交易网要求人工检查，请在专用浏览器完成网站校验后继续；未自动重试搜索")
+    _raise_search_block(site_capture.page_kind(page.url))
     if _result_part(page.url) != part_no.strip().upper() or _result_page_no(page.url) != page_no:
         raise RuntimeError("IC交易网返回的型号或页码与请求不一致")
     page.wait_for_selector("#resultList > li", timeout=30000)

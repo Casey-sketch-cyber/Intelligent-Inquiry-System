@@ -36,6 +36,8 @@ class SiteCaptureTests(unittest.TestCase):
             "http://www.ic.net.cn/searchPnCode.php",
             "https://www.ic.net.cn/searchPnCode.php/other",
             "https://member.ic.net.cn/login-other",
+            "https://member.ic.net.cn/login/../user.php",
+            "https://member.ic.net.cn/login/%2e%2e/user.php",
             "https://member.ic.net.cn/user.php",
             "https://web.qq.com/",
         ]
@@ -46,6 +48,8 @@ class SiteCaptureTests(unittest.TestCase):
                 attach.assert_not_called()
         with patch.object(site_capture, "_cdp_json", return_value=None):
             self.assertEqual(site_capture.inspect_browser(), (site_capture.STATUSES["closed"], None))
+        for url in (LOGIN, "https://member.ic.net.cn/login", "https://member.ic.net.cn/login/verify/step"):
+            self.assertEqual(site_capture.page_kind(url), "login")
 
     def test_cdp_discovery_does_not_follow_redirects_or_external_websocket(self):
         with patch.object(site_capture.http.client, "HTTPConnection") as connect:
@@ -60,7 +64,8 @@ class SiteCaptureTests(unittest.TestCase):
         }):
             self.assertIsNone(site_capture._socket_url())
 
-    def browser_session(self, *, loader_after=None, navigates=False, false_document=False, encoded=None):
+    def browser_session(self, *, loader_after=None, navigates=False, false_document=False, encoded=None,
+                        viewport_changes=None, navigate_after_input=False):
         events = {}
         frame = {"id": "main-frame", "loaderId": "loader", "url": CAPTCHA, "securityOrigin": "https://www.ic.net.cn"}
         if false_document:
@@ -75,13 +80,19 @@ class SiteCaptureTests(unittest.TestCase):
             if command == "Page.getFrameTree":
                 return {"frameTree": {"frame": frame.copy()}}
             if command == "Page.getLayoutMetrics":
-                return {"cssVisualViewport": {"pageX": 0, "pageY": 0, "clientWidth": 1600, "clientHeight": 900}}
+                viewport = {"pageX": 0, "pageY": 0, "clientWidth": 1600, "clientHeight": 900,
+                            "offsetX": 0, "offsetY": 0, "scale": 1}
+                return {"cssVisualViewport": viewport | (viewport_changes or {})}
             if command == "Page.captureScreenshot":
                 if loader_after:
                     frame["loaderId"] = loader_after
                 if navigates:
                     events["Page.navigatedWithinDocument"]({"frameId": "main-frame"})
                 return {"data": encoded if encoded is not None else base64.b64encode(JPEG).decode("ascii")}
+            if command.startswith("Input."):
+                if navigate_after_input:
+                    events["Page.frameStartedNavigating"]({"frameId": "main-frame"})
+                return {}
             self.assertEqual(command, "Page.enable")
             return {}
 
@@ -94,11 +105,12 @@ class SiteCaptureTests(unittest.TestCase):
             return_value=Mock(contexts=[context]))
         return session, page, context, manager, connect
 
-    def capture(self, manager, *, kind="verification"):
+    def capture(self, manager, *, kind="verification", frame=False):
         with patch.object(site_capture, "_cdp_json", side_effect=[
             [target("challenge", CAPTCHA)], {"webSocketDebuggerUrl": ENDPOINT},
         ]), patch.object(site_capture, "async_playwright", return_value=manager):
-            return site_capture.capture_site("challenge", kind)
+            capture = site_capture.capture_frame if frame else site_capture.capture_site
+            return capture("challenge", kind)
 
     def test_capture_uses_bound_page_session_without_touching_other_tabs(self):
         session, page, context, manager, connect = self.browser_session()
@@ -116,6 +128,7 @@ class SiteCaptureTests(unittest.TestCase):
         self.assertEqual([command for command, _ in commands], [
             "Target.getTargetInfo", "Page.enable", "Target.getTargetInfo", "Page.getFrameTree",
             "Page.getLayoutMetrics", "Page.captureScreenshot", "Target.getTargetInfo", "Page.getFrameTree",
+            "Page.getLayoutMetrics",
         ])
 
     def test_document_navigation_races_discard_images(self):
@@ -140,3 +153,79 @@ class SiteCaptureTests(unittest.TestCase):
             with self.subTest(encoded_length=len(data)):
                 _, _, _, manager, _ = self.browser_session(encoded=data)
                 self.assertIsNone(self.capture(manager))
+
+    def frame(self, **options):
+        _, _, _, manager, _ = self.browser_session(**options)
+        frame = self.capture(manager, frame=True)
+        self.assertIsInstance(frame, site_capture.PageFrame)
+        self.assertEqual(frame.image, JPEG)
+        return frame
+
+    def relay(self, frame, action, *, url=CAPTCHA, **options):
+        session, _, _, manager, _ = self.browser_session(**options)
+        with patch.object(site_capture, "_cdp_json", side_effect=[
+            [target("challenge", url)], {"webSocketDebuggerUrl": ENDPOINT},
+        ]), patch.object(site_capture, "async_playwright", return_value=manager):
+            done = site_capture.relay_input(frame, action)
+        inputs = [call.args for call in session.send.await_args_list if call.args[0].startswith("Input.")]
+        return done, inputs
+
+    def test_relay_click_uses_clipped_frame_dimensions_without_page_scroll_offset(self):
+        scroll = {"pageX": 20, "pageY": 100}
+        frame = self.frame(viewport_changes=scroll)
+        done, inputs = self.relay(frame, {"kind": "click", "x": 0.5, "y": 1}, viewport_changes=scroll)
+        self.assertTrue(done)
+        self.assertEqual([
+            (method, params["type"], params["x"], params["y"], params["buttons"], params["modifiers"])
+            for method, params in inputs
+        ], [
+            ("Input.dispatchMouseEvent", "mousePressed", 800, 899, 1, 0),
+            ("Input.dispatchMouseEvent", "mouseReleased", 800, 899, 0, 0),
+        ])
+
+    def test_relay_drag_uses_only_submitted_coordinates_and_stops_on_navigation(self):
+        frame = self.frame()
+        action = {"kind": "drag", "points": [{"x": 0.25, "y": 0.5}, {"x": 0.5, "y": 0.5}, {"x": 0.75, "y": 0.5}]}
+        done, inputs = self.relay(frame, action)
+        self.assertTrue(done)
+        self.assertEqual([(params["type"], params["x"], params["y"]) for _, params in inputs], [
+            ("mousePressed", 400, 450), ("mouseMoved", 800, 450),
+            ("mouseMoved", 1200, 450), ("mouseReleased", 1200, 450),
+        ])
+        done, inputs = self.relay(frame, action, navigate_after_input=True)
+        self.assertFalse(done)
+        self.assertEqual([params["type"] for _, params in inputs], ["mousePressed"])
+
+    def test_relay_discards_stale_viewport_or_address_and_pinched_frame(self):
+        frame = self.frame()
+        click = {"kind": "click", "x": 0.5, "y": 0.25}
+        self.assertEqual(self.relay(frame, click, viewport_changes={"pageY": 100}), (False, []))
+        self.assertEqual(self.relay(frame, click, url="https://www.ic.net.cn/search/fixture.html"), (False, []))
+        self.assertEqual(self.relay(frame, click, url="https://www.ic.net.cn/searchPnCode.php?session=other"), (False, []))
+        pinch = self.frame(viewport_changes={"scale": 1.5})
+        self.assertEqual(self.relay(pinch, click, viewport_changes={"scale": 1.5}), (False, []))
+
+    def test_relay_text_and_key_use_only_page_input_commands(self):
+        frame = self.frame()
+        self.assertEqual(self.relay(frame, {"kind": "text", "text": "人工文本 12"}),
+                         (True, [("Input.insertText", {"text": "人工文本 12"})]))
+        done, inputs = self.relay(frame, {"kind": "key", "key": "ArrowRight"})
+        self.assertTrue(done)
+        self.assertEqual([(method, params["type"], params["key"], params["modifiers"]) for method, params in inputs], [
+            ("Input.dispatchKeyEvent", "rawKeyDown", "ArrowRight", 0),
+            ("Input.dispatchKeyEvent", "keyUp", "ArrowRight", 0),
+        ])
+
+    def test_relay_rejects_out_of_range_and_unrecognized_actions_before_discovery(self):
+        frame = self.frame()
+        with patch.object(site_capture, "_page_targets") as discover:
+            for action in (
+                {"kind": "click", "x": True, "y": 0}, {"kind": "click", "x": float("nan"), "y": 0},
+                {"kind": "click", "x": 0.5, "y": 1.1}, {"kind": "drag", "points": [{"x": 0, "y": 1}] * 41},
+                {"kind": "key", "key": "F12"}, {"kind": "key", "key": "Tab", "ctrlKey": True},
+                {"kind": "text", "text": "含换行\n"}, {"kind": "text", "text": "x" * 257},
+                {"kind": "clipboard", "text": "unknown"},
+            ):
+                with self.subTest(action=action):
+                    self.assertFalse(site_capture.relay_input(frame, action))
+            discover.assert_not_called()

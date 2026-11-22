@@ -13,7 +13,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from inquiry import browser
 from ui import service
 from lanhost import config
-from lanhost.transport import Remote
+from lanhost.transport import Remote, WEBSITE_INPUT_PATH
 from vmhost.bridge import BridgeError
 
 INSTANCE = uuid.uuid4().hex
@@ -89,6 +89,28 @@ def website_alert_image():
     return Response(body, mimetype="image/jpeg", headers={
         "Cross-Origin-Resource-Policy": "same-origin", "X-Content-Type-Options": "nosniff",
     })
+
+
+@app.get("/api/lan/website-alert/frame")
+def website_alert_frame():
+    if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
+        return jsonify(error="请从本机工作台处理"), 403
+    events = request.args.getlist("event")
+    if len(events) != 1 or not re.fullmatch(r"[0-9a-f]{32}", events[0]) or len(request.args) != 1:
+        return jsonify(error="网站提醒编号无效"), 400
+    code, _, data = remote().call("GET", f"/api/worker/website-alert/frame?event={events[0]}", timeout=9)
+    return Response(data, status=code, mimetype="application/json", headers={
+        "Cross-Origin-Resource-Policy": "same-origin", "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.post("/api/lan/website-alert/input")
+def website_alert_input():
+    body = request.get_data()
+    if not request.is_json or not 0 < len(body) <= 8192:
+        return jsonify(error="人工输入格式无效"), 400
+    code, _, result = remote().call("POST", WEBSITE_INPUT_PATH, body, request.content_type, timeout=9)
+    return Response(result, status=code, mimetype="application/json")
 
 
 @app.route("/api/lan/website-alert/settings", methods=["GET", "PUT"])

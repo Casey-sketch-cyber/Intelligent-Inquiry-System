@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 from unittest.mock import Mock, patch
 
-from inquiry import db, icnet, qq, search_pacing
+from inquiry import db, icnet, qq, search_pacing, site_capture
 from inquiry.runner import Runner, Task
 from test_reliability import IsolatedTest
 
@@ -54,6 +54,28 @@ class SearchPacingTests(IsolatedTest):
     def attempts(self):
         with db.connect() as conn:
             return [dict(row) for row in conn.execute("SELECT * FROM search_attempt ORDER BY id")]
+
+    def test_nested_login_path_blocks_search_before_reserving_quota(self):
+        url = "https://member.ic.net.cn/login/continue?step=2"
+        self.context.pages.append(Mock(url=url))
+        with patch.object(site_capture, "_page_targets", return_value=[{"id": "LOGIN", "url": url}]), \
+             patch.object(icnet.incidents, "record"):
+            self.assertEqual(site_capture.inspect_browser()[0]["code"], "login")
+            with self.assertRaisesRegex(icnet.NotLoggedIn, "登录"):
+                icnet.search(self.context, "EXAMPLE")
+        self.assertEqual(self.attempts(), [])
+        self.page.goto.assert_not_called()
+
+    def test_login_redirect_uses_same_exact_ic_origin_and_preserves_one_attempt(self):
+        url = "https://member.ic.net.cn/login/continue?step=2"
+        self.page.goto.side_effect = lambda *args, **kwargs: setattr(self.page, "url", url)
+        with patch.object(icnet.incidents, "record"):
+            with self.assertRaises(icnet.NotLoggedIn):
+                icnet.search(self.context, "EXAMPLE")
+            with self.assertRaises(icnet.NotLoggedIn):
+                icnet.search(self.context, "EXAMPLE")
+        self.assertEqual(len(self.attempts()), 1)
+        self.page.goto.assert_called_once()
 
     def test_all_models_share_interval_and_rolling_window(self):
         for i in range(12):

@@ -12,10 +12,11 @@ from pathlib import Path
 
 from inquiry.runtime import ROOT, DATA_DIR
 from lanhost import config
-from lanhost.transport import Journal, WEBSITE_ALERT_IMAGE_PATH, make_server
+from lanhost.transport import Journal, WEBSITE_ALERT_IMAGE_PATH, WEBSITE_FRAME_PATH, WEBSITE_INPUT_PATH, make_server
 
 
 WEBSITE_ALERTS = None
+MANUAL_WEBSITE = None
 
 
 def state(cfg):
@@ -30,7 +31,31 @@ def state(cfg):
             "running": busy, "text": "授权实发送测试进行中" if trial["trial_running"] else ("常规实发已开放" if isolation.ALLOW_SEND else "常规发送已锁定"),
             "collection": collection.status(),
             "website_alert": WEBSITE_ALERTS.status() if WEBSITE_ALERTS else None,
+            "manual_website_support": MANUAL_WEBSITE is not None,
             "normal_capability": 1, "support_capability": 1, **trial}
+
+
+def _manual_website_request(method, event, body):
+    from lanhost.manual_website import ManualPageConflict, ManualPageUnavailable
+
+    status = 200
+    try:
+        if MANUAL_WEBSITE is None:
+            raise ManualPageUnavailable("当前工作机不支持远程人工处理")
+        if method == "GET":
+            payload = MANUAL_WEBSITE.frame(event)
+        else:
+            if not 0 < len(body) <= 8192:
+                raise ValueError()
+            MANUAL_WEBSITE.relay(json.loads(body))
+            payload = {"ok": True}
+    except ManualPageConflict as error:
+        status, payload = 409, {"error": str(error)}
+    except ManualPageUnavailable as error:
+        status, payload = 503, {"error": str(error)}
+    except ValueError:
+        status, payload = 400, {"error": "人工输入格式无效"}
+    return status, {"Content-Type": "application/json"}, json.dumps(payload, ensure_ascii=False).encode()
 
 
 def handler(cfg):
@@ -51,6 +76,10 @@ def handler(cfg):
         if method == "GET" and (match := WEBSITE_ALERT_IMAGE_PATH.fullmatch(path)):
             data = WEBSITE_ALERTS.image(match[1]) if WEBSITE_ALERTS else None
             return (200, {"Content-Type": "image/jpeg"}, data) if data is not None else (404, {}, b"")
+        if method == "GET" and (match := WEBSITE_FRAME_PATH.fullmatch(path)):
+            return _manual_website_request(method, match[1], b"")
+        if method == "POST" and path == WEBSITE_INPUT_PATH:
+            return _manual_website_request(method, None, body)
         if path == "/api/worker/website-alert/settings" and method in ("GET", "PUT"):
             from lanhost import alert_webhook
             try:
@@ -156,7 +185,7 @@ def local_app(cfg, export, rpc_port):
 
 
 def main():
-    global WEBSITE_ALERTS
+    global WEBSITE_ALERTS, MANUAL_WEBSITE
     parser = argparse.ArgumentParser()
     parser.add_argument("--setup", type=Path, help="首次配对用的办公电脑部署资料")
     parser.add_argument("--no-browser", action="store_true")
@@ -195,9 +224,14 @@ def main():
     ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
     server.start_background_services()
     from inquiry import jobs
+    from lanhost import live_trial
+    from lanhost.manual_website import ManualWebsite
     from lanhost.website_alerts import WebsiteAlerts
     jobs.start_pump()
     WEBSITE_ALERTS = WebsiteAlerts(config.LAN_DIR / "website-alert.jpg")
+    MANUAL_WEBSITE = ManualWebsite(WEBSITE_ALERTS, available=lambda: not (
+        isolation.DRAINING.is_set() or server.run_state()["running"] or live_trial.active_status()["trial_running"]
+    ))
     alert_monitor = WEBSITE_ALERTS.start(isolation.DRAINING)
     threading.Thread(target=local.serve_forever, daemon=True, name="worker-local-panel").start()
     try:

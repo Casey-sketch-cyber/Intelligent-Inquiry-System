@@ -1,4 +1,5 @@
 """双机页面浏览器验收：模拟连接/业务响应，不启动 QQ 或跨机操作。"""
+import base64
 import json
 import sys
 import tempfile
@@ -12,6 +13,114 @@ from ui import service
 from lanhost import controller, worker
 from PIL import Image, ImageDraw
 from playwright.sync_api import sync_playwright, expect
+
+
+def verify_manual_website_panel(page, connection, image_fixture):
+    event = "4" * 32
+    path = "/api/lan/website-alert"
+    frames, actions = [], []
+    capture_failure, input_status = False, 200
+    screenshot = base64.b64encode(image_fixture.read_bytes()).decode()
+
+    def frame(route):
+        nonlocal capture_failure
+        assert route.request.method == "GET"
+        assert route.request.url.endswith(f"?event={event}")
+        token = f"{len(frames) + 16:032x}"
+        frames.append(token)
+        if capture_failure:
+            capture_failure = False
+            route.fulfill(status=503, json={"error": "模拟截图暂不可用"})
+        else:
+            route.fulfill(json={"frame_token": token, "image": screenshot})
+
+    def operate(route):
+        assert route.request.method == "POST"
+        payload = route.request.post_data_json
+        assert payload["event"] == event and payload["frame_token"] == frames[-1]
+        actions.append(payload)
+        route.fulfill(status=input_status, json={"ok": input_status == 200})
+
+    page.route(f"**{path}/frame?event=*", frame)
+    page.route(f"**{path}/input", operate)
+    connection["website_alert"] = {"id": event, "kind": "verification", "image_ready": False}
+    page.evaluate("refresh()")
+    opener = page.locator("#openWebsiteManual")
+    expect(opener).to_be_hidden()
+    connection["manual_website_support"] = True
+    page.evaluate("refresh()")
+    expect(opener).to_be_visible()
+    panel = page.locator("#websiteManual")
+    image = page.locator("#websiteManualImage")
+    status = page.locator("#websiteManualStatus")
+    field = page.locator("#websiteManualText")
+    send = page.locator("#sendWebsiteManualText")
+    opener.evaluate("button => button.click()")
+    expect(panel).to_be_hidden()
+    assert not frames
+    opener.click()
+    expect(panel).to_be_visible()
+    expect(image).to_have_attribute("aria-disabled", "false")
+    expect(field).to_have_attribute("type", "password")
+    image.evaluate("""image => image.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}))""")
+    assert not actions
+
+    image.click(position={"x": 100, "y": 60})
+    expect(image).to_have_attribute("aria-disabled", "false")
+    click = actions[-1]["action"]
+    assert click["kind"] == "click"
+    assert abs(click["x"] - 100 / 400) < 0.005 and abs(click["y"] - 60 / 190) < 0.005
+
+    before = len(frames)
+    box = image.bounding_box()
+    page.mouse.move(box["x"] + 35, box["y"] + 50)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 110, box["y"] + 56)
+    page.wait_for_timeout(2700)
+    assert len(frames) == before
+    page.mouse.move(box["x"] + 135, box["y"] + 61)
+    page.mouse.up()
+    expect(image).to_have_attribute("aria-disabled", "false")
+    drag = actions[-1]["action"]
+    assert drag["kind"] == "drag" and len(drag["points"]) == 3
+    assert [round(point["x"] * 400) for point in drag["points"]] == [35, 110, 135]
+
+    image.press("ArrowDown")
+    expect(image).to_have_attribute("aria-disabled", "false")
+    assert actions[-1]["action"] == {"kind": "key", "key": "ArrowDown"}
+    image.press("Control+A")
+    assert len(actions) == 3
+
+    field.fill("仅供离线测试的文字")
+    send.evaluate("button => button.click()")
+    assert len(actions) == 3
+    capture_failure, input_status = True, 409
+    send.click()
+    expect(status).to_contain_text("画面暂时不可用")
+    expect(field).to_have_value("仅供离线测试的文字")
+    expect(send).to_be_disabled()
+    expect(image).to_have_attribute("aria-disabled", "false", timeout=9000)
+    expect(status).to_have_text("画面已更新，请核对后再操作。")
+    assert len(actions) == 4
+    assert actions[-1]["action"] == {"kind": "text", "text": "仅供离线测试的文字"}
+    input_status = 200
+    send.click()
+    expect(field).to_have_value("")
+    assert actions[-1]["frame_token"] != actions[-2]["frame_token"]
+
+    page.locator("#closeWebsiteManual").click()
+    expect(panel).to_be_hidden()
+    assert image.get_attribute("src") is None
+    opener.click()
+    expect(image).to_have_attribute("aria-disabled", "false")
+    field.fill("关闭时清空")
+    connection["website_alert"] = {"id": "5" * 32, "kind": "login", "image_ready": False}
+    page.evaluate("refresh()")
+    expect(panel).to_be_hidden()
+    expect(field).to_have_value("")
+    assert image.get_attribute("src") is None
+    connection["website_alert"] = None
+    page.evaluate("refresh()")
 
 
 def verify_website_webhook_settings(page):
@@ -289,6 +398,7 @@ def main():
                     connection["website_alert"] = None
                     assert controls == ["resume", "pause"]
 
+                    verify_manual_website_panel(page, connection, image_fixture)
                     verify_website_webhook_settings(page)
 
                     # 工作机页面使用真实本机 Flask 路由；浏览器打开动作被模拟，不接触 QQ。
@@ -315,7 +425,7 @@ def main():
                                "停止中禁止人工登录", "断线保留页面/草稿且禁止操作", "恢复不重载/重放请求",
                                "已配对离线不显示安装引导", "慢检查不重叠/错误详情", "工作机本地登录入口",
                                "登录/验证码提醒和截图", "设备提醒去重", "断线/人工处理完成后清除提醒",
-                               "群提醒地址不回显，保存和移除"],
+                               "群提醒地址不回显，保存和移除", "手动处理的画面锁定、坐标、键盘与重试边界"],
                     "physical_second_pc_tested": False, "qq_operations": 0}, ensure_ascii=False, indent=2), encoding="utf-8")
                 print("LAN panels UI smoke passed; no QQ actions or physical second-PC operations.")
             finally:
