@@ -227,18 +227,8 @@ def qq_status() -> dict:
 
 
 def browser_status() -> dict:
-    if not browser.cdp_alive():
-        return {"ok": False, "text": "未启动", "code": "closed"}
-    try:
-        with urllib.request.urlopen(f"{browser.CDP_URL}/json/list", timeout=2) as r:
-            urls = [t.get("url", "") for t in json.loads(r.read()) if t.get("type") == "page"]
-    except OSError:
-        urls = []
-    if any("member.ic.net.cn/login" in u for u in urls):
-        return {"ok": False, "text": "需要登录", "code": "login"}
-    if any("ic.net.cn/searchPnCode.php" in u for u in urls):
-        return {"ok": False, "text": "需要人工校验", "code": "verification"}
-    return {"ok": True, "text": "已就绪", "code": "ok"}
+    from inquiry.site_capture import inspect_browser
+    return inspect_browser()[0]
 
 
 def env_status() -> dict:

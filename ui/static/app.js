@@ -686,6 +686,18 @@ async function renderSettings() {
           <div><button class="btn btn-sm" id="btnDs">${icon("link", 15)}测试连接</button></div>
         </div>
       </div>
+      ${location.pathname === "/workbench" ? `
+      <div class="card">
+        <div class="card-h"><h3>网站校验群提醒</h3><span class="small muted" id="webhookStatus" role="status"></span></div>
+        <div class="card-b">
+          <div class="field"><label for="websiteWebhook">企业微信群机器人 Webhook</label>
+            <input class="input mono" id="websiteWebhook" type="password" autocomplete="off" maxlength="256">
+            <div class="help">配置后，工作机需要登录或人工校验时会向该群发送文字提醒。</div>
+          </div>
+          <div class="row"><button class="btn btn-sm" id="saveWebsiteWebhook" disabled>保存地址</button>
+            <button class="btn btn-sm" id="removeWebsiteWebhook" style="display:none">移除地址</button></div>
+        </div>
+      </div>` : ""}
     </div>
     <div class="row mt" style="justify-content:flex-end;position:sticky;bottom:16px">
       <button class="btn" id="btnReset">${icon("refresh", 16)}放弃修改</button>
@@ -697,6 +709,7 @@ async function renderSettings() {
   prev();
   $("#btnReset").onclick = renderSettings;
   $("#btnSave").onclick = saveSettings;
+  bindWebsiteWebhook();
   $("#cardFile").onchange = async (e) => {
     const f = e.target.files[0];
     if (!f) return;
@@ -705,6 +718,43 @@ async function renderSettings() {
     try { await api("/api/card", { method: "POST", body: fd }); toast("名片已更换"); renderSettings(); refreshOverview(); } catch (err) { toast(err.message, "bad"); }
   };
   bindCommon();
+}
+
+async function bindWebsiteWebhook() {
+  const field = $("#websiteWebhook");
+  if (!field) return;
+  const status = $("#webhookStatus");
+  const save = $("#saveWebsiteWebhook");
+  const remove = $("#removeWebsiteWebhook");
+  const path = "/api/lan/website-alert/settings";
+  const show = ({configured}) => {
+    status.textContent = configured ? "已配置" : "未配置";
+    remove.style.display = configured ? "" : "none";
+  };
+  const update = async (value) => {
+    save.disabled = remove.disabled = true;
+    try {
+      show(await api(path, {method: "PUT", json: {webhook_url: value}}));
+      field.value = "";
+      toast(value ? "群提醒地址已保存" : "群提醒地址已移除");
+    } catch (err) {
+      toast(err.message, "bad");
+    } finally {
+      save.disabled = !field.value.trim();
+      remove.disabled = false;
+    }
+  };
+  try {
+    show(await api(path));
+    field.oninput = () => { save.disabled = !field.value.trim(); };
+    save.onclick = () => update(field.value.trim());
+    remove.onclick = () => update("");
+  } catch (err) {
+    status.textContent = "提醒设置暂不可用";
+    field.disabled = true;
+    return;
+  }
+  save.disabled = !field.value.trim();
 }
 
 async function saveSettings() {

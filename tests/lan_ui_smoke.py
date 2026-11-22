@@ -10,19 +10,82 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from inquiry import runtime, browser
 from ui import service
 from lanhost import controller, worker
+from PIL import Image, ImageDraw
 from playwright.sync_api import sync_playwright, expect
 
 
+def verify_website_webhook_settings(page):
+    page.unroute("**/workbench")
+    page.route("**/api/overview", lambda route: route.fulfill(json={
+        "env": {key: {"ok": True, "text": "模拟"} for key in ("qq", "browser", "deepseek")},
+        "run": {"running": False}, "runtime": {"dedicated_worker": True}, "collection": {},
+    }))
+    def regular_settings(route):
+        assert route.request.method == "GET"
+        route.fulfill(json={"settings": {"inquiry": {"template": "{part} {qty}"}}, "schema": []})
+
+    page.route("**/api/settings", regular_settings)
+    configured, writes = False, []
+
+    def webhook_settings(route):
+        nonlocal configured
+        if route.request.method == "PUT":
+            changes = route.request.post_data_json
+            assert list(changes) == ["webhook_url"]
+            writes.append(changes["webhook_url"])
+            configured = bool(changes["webhook_url"])
+        else:
+            assert route.request.method == "GET"
+        route.fulfill(json={"configured": configured})
+
+    path = "/api/lan/website-alert/settings"
+    page.route(f"**{path}", webhook_settings)
+    page.locator("#workbench").evaluate("frame => frame.src='/workbench?fixture=settings#/settings'")
+    frame = page.frame_locator("#workbench")
+    field = frame.locator("#websiteWebhook")
+    status = frame.locator("#webhookStatus")
+    save = frame.locator("#saveWebsiteWebhook")
+    remove = frame.locator("#removeWebsiteWebhook")
+    expect(status).to_have_text("未配置")
+    expect(field).to_have_attribute("type", "password")
+    expect(field).to_have_value("")
+    expect(save).to_be_disabled()
+    expect(remove).to_be_hidden()
+    fake_url = "https://example.invalid/fixture-webhook"
+    field.fill(fake_url)
+    save.click()
+    expect(status).to_have_text("已配置")
+    expect(field).to_have_value("")
+    expect(remove).to_be_visible()
+    with page.expect_response(lambda r: r.url.endswith(path) and r.request.method == "GET"):
+        page.locator("#workbench").evaluate("frame => frame.src='/workbench?fixture=settings-reload#/settings'")
+    expect(status).to_have_text("已配置")
+    expect(field).to_have_value("")
+    expect(save).to_be_disabled()
+    remove.click()
+    expect(status).to_have_text("未配置")
+    expect(remove).to_be_hidden()
+    assert writes == [fake_url, ""]
+
+
 def main():
-    output = runtime.DATA_DIR / "qa/lan-connection-20261023"
+    output = runtime.DATA_DIR / "qa/lan-ui"
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=runtime.TEMP_DIR, prefix="lan-ui-") as directory:
         folder = Path(directory)
+        image_fixture = folder / "website-alert.jpg"
+        with Image.new("RGB", (400, 190), "#eff3fb") as image:
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((36, 24, 364, 166), radius=12, fill="#ffffff", outline="#d1daeb")
+            draw.rectangle((62, 52, 222, 66), fill="#32516f")
+            draw.rounded_rectangle((62, 86, 338, 132), radius=8, fill="#e7dcfb")
+            image.save(image_fixture)
         connection = {"online": False, "paired": False, "text": "等待导入 QQ 工作机的连接文件"}
         local = {"name": "测试 QQ 工作机", "manual": True, "manual_ready": True,
                  "connection_file": r"D:\TianxinWorker\data\lan\办公电脑连接.json"}
         dispatch = Mock(return_value=(200, {"Content-Type": "application/json"}, b'{"ok":true}'))
-        with patch.object(worker, "state", side_effect=lambda _: local.copy()), \
+        with patch.object(controller, "remote", side_effect=AssertionError("离线测试禁止连接真实工作机")), \
+                patch.object(worker, "state", side_effect=lambda _: local.copy()), \
                 patch.object(worker, "handler", return_value=dispatch):
             servers = [service.bind_server(controller.app, 0),
                        service.bind_server(worker.local_app({}, folder / "connection.json", 8778), 0)]
@@ -33,6 +96,29 @@ def main():
                     b = pw.chromium.launch(executable_path=str(next(p for p in browser.EDGE_CANDIDATES if p.exists())),
                         headless=True, args=[f"--disk-cache-dir={folder / 'cache'}", f"--crash-dumps-dir={folder / 'crashes'}"])
                     page = b.new_page(viewport={"width": 1440, "height": 1050})
+                    page.add_init_script("""
+                      window.deviceAlerts = {notifications: [], closed: 0, sounds: 0, requests: 0};
+                      window.Notification = class {
+                        static permission = "default";
+                        static async requestPermission() {
+                          window.deviceAlerts.requests++;
+                          this.permission = "granted";
+                          return this.permission;
+                        }
+                        constructor(title, opts) { window.deviceAlerts.notifications.push({title, ...opts}); }
+                        close() { window.deviceAlerts.closed++; }
+                      };
+                      window.AudioContext = class {
+                        state = "suspended";
+                        currentTime = 0;
+                        destination = {};
+                        async resume() { this.state = "running"; }
+                        createOscillator() {
+                          return {frequency: {}, connect(){}, start(){window.deviceAlerts.sounds++}, stop(){}};
+                        }
+                        createGain() { return {gain:{setValueAtTime(){}, exponentialRampToValueAtTime(){}}, connect(){}}; }
+                      };
+                    """)
                     errors = []
                     page.on("pageerror", lambda e: errors.append(str(e)))
                     page.route("**/api/lan/status", lambda route: route.fulfill(json=connection))
@@ -54,8 +140,16 @@ def main():
 
                     for name in ("pause", "resume"):
                         page.route("**/api/lan/" + name, control)
+                    image_requests = []
+
+                    def screenshot(route):
+                        image_requests.append(route.request.url.split("?", 1)[1])
+                        route.fulfill(content_type="image/jpeg", path=image_fixture)
+
+                    page.route("**/api/lan/website-alert/image?event=*", screenshot)
                     page.goto(f"http://127.0.0.1:{servers[0].port}/")
                     expect(page.locator("#workbench")).to_be_hidden()
+                    expect(page.locator("#websiteAlert")).to_be_hidden()
                     expect(page.locator("#resume")).to_be_disabled()
                     page.locator("#import").click()
                     expect(page.locator("#feedback")).to_contain_text("请选择有效")
@@ -142,6 +236,61 @@ def main():
                     page.evaluate("refresh()")
                     expect(page.locator("#connectionProblem")).to_be_hidden()
 
+                    # 只显示已配对状态里的正式事件，图片准备好后才读取。
+                    event = {"id": "1" * 32, "kind": "verification", "image_ready": False}
+                    connection["website_alert"] = event
+                    page.evaluate("refresh()")
+                    expect(page.locator("#websiteAlert")).to_be_visible()
+                    expect(page.locator("#websiteAlertTitle")).to_have_text("IC交易网需要人工校验")
+                    expect(page.locator("#websiteAlertInstructions")).to_contain_text("第二台电脑")
+                    expect(page.locator("#websiteAlertImage")).to_be_hidden()
+                    expect(page.locator("#websiteAlertAnnouncement")).to_contain_text("完成验证码")
+                    assert image_requests == []
+                    event["image_ready"] = True
+                    page.evaluate("refresh()")
+                    expect(page.locator("#websiteAlertImage")).to_be_visible()
+                    assert page.locator("#websiteAlertImage").evaluate("img => img.naturalWidth") == 400
+                    assert image_requests == [f"event={event['id']}"]
+                    page.screenshot(path=str(output / "office-website-alert.png"), full_page=True)
+                    assert page.evaluate("deviceAlerts.requests") == 0
+                    page.get_by_role("button", name="启用桌面提醒和提示音").click()
+                    expect(page.locator("#enableWebsiteAlerts")).to_be_hidden()
+                    page.evaluate("refresh()")
+                    assert page.evaluate("deviceAlerts.notifications.length") == 1
+                    assert page.evaluate("deviceAlerts.sounds") == 1
+                    assert image_requests == [f"event={event['id']}"]
+
+                    connection["online"] = False
+                    page.evaluate("refresh()")
+                    expect(page.locator("#websiteAlert")).to_be_hidden()
+                    assert page.locator("#websiteAlertImage").get_attribute("src") is None
+                    assert page.evaluate("deviceAlerts.closed") == 1
+                    connection["online"] = True
+                    page.evaluate("refresh()")
+                    expect(page.locator("#websiteAlertImage")).to_be_visible()
+                    expect(page.locator("#websiteAlertAnnouncement")).to_have_text("")
+                    assert page.evaluate("deviceAlerts.notifications.length") == 1
+                    assert page.evaluate("deviceAlerts.sounds") == 1
+
+                    connection["website_alert"] = {"id": "2" * 32, "kind": "login", "image_ready": False}
+                    page.evaluate("refresh()")
+                    expect(page.locator("#websiteAlertTitle")).to_have_text("IC交易网需要登录")
+                    assert page.evaluate("deviceAlerts.notifications.length") == 2
+                    assert page.evaluate("deviceAlerts.sounds") == 2
+                    connection["website_alert"] = None
+                    page.evaluate("refresh()")
+                    expect(page.locator("#websiteAlert")).to_be_hidden()
+                    assert page.evaluate("deviceAlerts.closed") == 2
+                    count = len(image_requests)
+                    connection["website_alert"] = {"id": "../not-an-event", "kind": "login", "image_ready": True}
+                    page.evaluate("refresh()")
+                    expect(page.locator("#websiteAlert")).to_be_hidden()
+                    assert len(image_requests) == count
+                    connection["website_alert"] = None
+                    assert controls == ["resume", "pause"]
+
+                    verify_website_webhook_settings(page)
+
                     # 工作机页面使用真实本机 Flask 路由；浏览器打开动作被模拟，不接触 QQ。
                     page.goto(f"http://127.0.0.1:{servers[1].port}/")
                     expect(page.locator("#status")).to_contain_text("已暂停")
@@ -164,7 +313,9 @@ def main():
                     "passed": True,
                     "checks": ["未配对/无效文件", "导入连接", "工作台只读展示", "暂停/恢复单次提交",
                                "停止中禁止人工登录", "断线保留页面/草稿且禁止操作", "恢复不重载/重放请求",
-                               "已配对离线不显示安装引导", "慢检查不重叠/错误详情", "工作机本地登录入口"],
+                               "已配对离线不显示安装引导", "慢检查不重叠/错误详情", "工作机本地登录入口",
+                               "登录/验证码提醒和截图", "设备提醒去重", "断线/人工处理完成后清除提醒",
+                               "群提醒地址不回显，保存和移除"],
                     "physical_second_pc_tested": False, "qq_operations": 0}, ensure_ascii=False, indent=2), encoding="utf-8")
                 print("LAN panels UI smoke passed; no QQ actions or physical second-PC operations.")
             finally:

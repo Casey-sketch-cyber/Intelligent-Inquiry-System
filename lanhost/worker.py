@@ -12,7 +12,10 @@ from pathlib import Path
 
 from inquiry.runtime import ROOT, DATA_DIR
 from lanhost import config
-from lanhost.transport import Journal, make_server
+from lanhost.transport import Journal, WEBSITE_ALERT_IMAGE_PATH, make_server
+
+
+WEBSITE_ALERTS = None
 
 
 def state(cfg):
@@ -26,6 +29,7 @@ def state(cfg):
             "manual_ready": isolation.MANUAL.is_set() and not busy,
             "running": busy, "text": "授权实发送测试进行中" if trial["trial_running"] else ("常规实发已开放" if isolation.ALLOW_SEND else "常规发送已锁定"),
             "collection": collection.status(),
+            "website_alert": WEBSITE_ALERTS.status() if WEBSITE_ALERTS else None,
             "normal_capability": 1, "support_capability": 1, **trial}
 
 
@@ -44,6 +48,22 @@ def handler(cfg):
                 return 409, {"Content-Type": "application/json"}, json.dumps({"error": str(exc)[:400]}).encode()
         if method == "GET" and path == "/api/worker/status":
             return 200, {"Content-Type": "application/json"}, json.dumps(state(cfg), ensure_ascii=False).encode()
+        if method == "GET" and (match := WEBSITE_ALERT_IMAGE_PATH.fullmatch(path)):
+            data = WEBSITE_ALERTS.image(match[1]) if WEBSITE_ALERTS else None
+            return (200, {"Content-Type": "image/jpeg"}, data) if data is not None else (404, {}, b"")
+        if path == "/api/worker/website-alert/settings" and method in ("GET", "PUT"):
+            from lanhost import alert_webhook
+            try:
+                if method == "PUT":
+                    if len(body) > 2048:
+                        raise ValueError()
+                    payload = json.loads(body)
+                    alert_webhook.save(payload.get("webhook_url") if isinstance(payload, dict) else None)
+                return 200, {"Content-Type": "application/json"}, json.dumps({"configured": bool(alert_webhook.load())}).encode()
+            except ValueError:
+                return 400, {"Content-Type": "application/json"}, '{"error":"请输入有效的企业微信群机器人 Webhook 地址"}'.encode()
+            except OSError:
+                return 503, {"Content-Type": "application/json"}, '{"error":"工作机无法保存提醒设置"}'.encode()
         if method == "POST" and route == "/api/worker/sending":
             try:
                 config.set_sending(cfg, json.loads(body).get("enabled"))
@@ -136,6 +156,7 @@ def local_app(cfg, export, rpc_port):
 
 
 def main():
+    global WEBSITE_ALERTS
     parser = argparse.ArgumentParser()
     parser.add_argument("--setup", type=Path, help="首次配对用的办公电脑部署资料")
     parser.add_argument("--no-browser", action="store_true")
@@ -174,7 +195,10 @@ def main():
     ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
     server.start_background_services()
     from inquiry import jobs
+    from lanhost.website_alerts import WebsiteAlerts
     jobs.start_pump()
+    WEBSITE_ALERTS = WebsiteAlerts(config.LAN_DIR / "website-alert.jpg")
+    alert_monitor = WEBSITE_ALERTS.start(isolation.DRAINING)
     threading.Thread(target=local.serve_forever, daemon=True, name="worker-local-panel").start()
     try:
         if not args.no_browser:
@@ -183,6 +207,8 @@ def main():
         httpd.serve_forever()
     finally:
         isolation.DRAINING.set()
+        alert_monitor.join(timeout=2)
+        WEBSITE_ALERTS.clear()
         local.shutdown()
         local.server_close()
         httpd.server_close()
