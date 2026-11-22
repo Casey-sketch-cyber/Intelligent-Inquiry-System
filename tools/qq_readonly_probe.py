@@ -2,11 +2,11 @@
 
 从项目根目录执行：python -B tools/qq_readonly_probe.py --session 名称 --seconds 12
 不会自动打开、恢复、切换或滚动 QQ；应先手动选择待检查的会话。
+使用新的诊断名称会根据本机业务库建立隔离副本。
 """
 import argparse
 import contextlib
 import json
-import sqlite3
 import sys
 import threading
 import time
@@ -19,6 +19,16 @@ sys.path.insert(0, str(ROOT))
 from inquiry import db, llm, observer, qq
 from inquiry.history import signature
 from inquiry.runner import Runner, Task
+from inquiry.runtime import require_d_path
+
+
+def send_counts(production):
+    with db.open_existing(production, read_only=True) as conn:
+        return {key: conn.execute(sql).fetchone()[0] for key, sql in {
+            "outgoing": "SELECT COUNT(*) FROM message WHERE direction='out'",
+            "send_attempt": "SELECT COUNT(*) FROM send_attempt",
+            "queued": "SELECT COUNT(*) FROM outbox WHERE status IN ('queued','sending')",
+        }.items()}
 
 
 def main():
@@ -28,26 +38,20 @@ def main():
     args = parser.parse_args()
     if not args.session.replace("-", "").replace("_", "").isalnum():
         parser.error("session 只能包含字母、数字、横线和下划线")
-    folder = ROOT / "data" / "qa" / args.session
-    folder.mkdir(parents=True, exist_ok=True)
     production = db.DB_PATH
-    isolated = folder / "readonly.db"
-    if not isolated.exists():
-        with sqlite3.connect(f"file:{production.as_posix()}?mode=ro", uri=True) as source:
-            with sqlite3.connect(isolated) as target:
-                source.backup(target)
-
-    def send_counts():
-        with sqlite3.connect(f"file:{production.as_posix()}?mode=ro", uri=True) as c:
-            return {key: c.execute(sql).fetchone()[0] for key, sql in {
-                "outgoing": "SELECT COUNT(*) FROM message WHERE direction='out'",
-                "send_attempt": "SELECT COUNT(*) FROM send_attempt",
-                "queued": "SELECT COUNT(*) FROM outbox WHERE status IN ('queued','sending')",
-            }.items()}
-
-    baseline = send_counts()
+    baseline = send_counts(production)
     if baseline["queued"]:
         raise RuntimeError("正式发件箱有待发送内容，请先暂停，诊断未开始")
+    folder = require_d_path(ROOT / "data" / "qa" / args.session)
+    isolated = require_d_path(folder / "readonly.db")
+    if isolated.exists():
+        if production.samefile(isolated):
+            raise RuntimeError("诊断副本指向正式数据库，请使用新的会话名")
+        with db.open_existing(isolated, read_only=True):
+            pass  # 复用上次副本前先校验其日志模式。
+    else:
+        folder.mkdir(parents=True, exist_ok=True)
+        db.snapshot(production, isolated)
     report = {"started_at": time.time(), "production_before": baseline,
               "isolated_database": str(isolated), "forbidden_calls": [], "samples": []}
 
@@ -165,7 +169,7 @@ def main():
             report["qq_foreground_samples"] = sum(s["foreground"] == win.NativeWindowHandle for s in report["samples"])
             report["foreground_changes"] = sum(a["foreground"] != b["foreground"] for a, b in zip(report["samples"], report["samples"][1:]))
             report["cursor_changes"] = sum(a["cursor"] != b["cursor"] for a, b in zip(report["samples"], report["samples"][1:]))
-    report["production_after"] = send_counts()
+    report["production_after"] = send_counts(production)
     report["finished_at"] = time.time()
     output = folder / f"probe-{time.time_ns()}.json"
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

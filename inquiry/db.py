@@ -123,17 +123,20 @@ def _has_wal_fix(version):
             or (version[:2] == (3, 44) and version >= (3, 44, 6)))
 
 
+def _checked_journal_mode(conn):
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    if mode == "wal" and not _has_wal_fix(sqlite3.sqlite_version_info):
+        raise sqlite3.OperationalError("当前 SQLite 缺少 WAL 修复，请先安装项目锁定依赖再打开该数据库")
+    return mode
+
+
 def _configure_journal(conn, timeout):
     deadline = time.monotonic() + timeout
     enable_wal = _has_wal_fix(sqlite3.sqlite_version_info)
     while True:
         try:
-            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-            if not enable_wal:
-                if mode == "wal":
-                    raise sqlite3.OperationalError("当前 SQLite 缺少 WAL 修复，请先安装项目锁定依赖再打开该数据库")
-                return
-            if mode == "wal" or conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal":
+            mode = _checked_journal_mode(conn)
+            if not enable_wal or mode == "wal" or conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal":
                 return
             raise sqlite3.OperationalError("业务数据库无法启用 WAL")
         except sqlite3.OperationalError as error:
@@ -165,13 +168,24 @@ def connect(*, timeout=30):
         conn.close()
 
 
+@contextmanager
+def open_existing(path, *, read_only=False, timeout=30):
+    """让维护工具访问现有业务库，仅检查日志模式，事务由调用者管理。"""
+    uri = Path(path).absolute().as_uri()
+    mode = "ro" if read_only else "rw"
+    with closing(sqlite3.connect(f"{uri}?mode={mode}", uri=True, timeout=timeout)) as conn:
+        conn.execute("PRAGMA temp_store=MEMORY")
+        _checked_journal_mode(conn)
+        yield conn
+
+
 def snapshot(source, target):
     """备份包含已提交 WAL 数据的单文件快照，成功后再替换迁移库。"""
     if source.resolve() == target.resolve():
         raise ValueError("备份目录必须不同于业务数据库")
     with tempfile.TemporaryDirectory(prefix="sqlite-backup-", dir=target.parent) as folder:
         temporary = Path(folder) / target.name
-        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=30)) as src:
+        with open_existing(source, read_only=True) as src:
             with closing(sqlite3.connect(temporary, timeout=30)) as dst:
                 src.backup(dst)
                 if dst.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":

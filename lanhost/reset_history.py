@@ -7,12 +7,11 @@ import hashlib
 import json
 import os
 import shutil
-import sqlite3
 import sys
 import time
 import urllib.request
 import uuid
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -49,8 +48,31 @@ def safe_path(path, root):
     return path
 
 
+@contextmanager
+def _open_database(path, *, read_only=False):
+    from inquiry import db
+
+    guard = getattr(db, "open_existing", None)
+    if guard is not None:
+        with guard(path, read_only=read_only) as conn:
+            yield conn
+        return
+    # 独立工具可能运行在旧工作机。SQLite 文件头的读写版本 1 表示回滚日志。
+    with path.open("rb") as file:
+        versions = file.read(20)[18:20]
+    error = "Installed worker must be updated before this tool can open the business database"
+    if versions != b"\x01\x01":
+        raise RuntimeError(error)
+    mode = "ro" if read_only else "rw"
+    with closing(db.sqlite3.connect(path.as_uri() + f"?mode={mode}", uri=True, timeout=30)) as conn:
+        if conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+            raise RuntimeError(error)
+        yield conn
+
+
 def clear_history(root, expected_fingerprint=None):
     """调用前必须退出工作机；双锁防止旧解析线程写入被复用的记录 ID。"""
+    from inquiry import db
     from ui import service
     root = safe_path(root, root)
     data = safe_path(root / "data", root)
@@ -63,7 +85,7 @@ def clear_history(root, expected_fingerprint=None):
             if handle is None:
                 raise RuntimeError("Worker or inquiry runner is still active; history was kept")
             stack.enter_context(handle)
-        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=30)) as check:
+        with _open_database(database, read_only=True) as check:
             check_tasks(check, expected_fingerprint)
         backup = safe_path(data / "backups" / ("inquiry-reset-" + datetime.now().strftime("%Y%m%d-%H%M%S")
                                                 + "-" + uuid.uuid4().hex[:8]), root)
@@ -72,19 +94,19 @@ def clear_history(root, expected_fingerprint=None):
         report_files = sorted(p for p in reports.iterdir() if p.is_file()) if reports.exists() else []
         for file in report_files:
             safe_path(file, root)
-        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=30)) as source:
+        with _open_database(database, read_only=True) as source:
             source.execute("PRAGMA temp_store=MEMORY")
             if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RuntimeError("Business database integrity check failed; history was kept")
             before = {table: source.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                       for table in (*TABLES, "send_attempt")}
-            with closing(sqlite3.connect(backup / "inquiry.db")) as target:
+            with closing(db.sqlite3.connect(backup / "inquiry.db")) as target:
                 source.backup(target)
                 # WAL 模式会随备份复制。只在副本上切换日志模式，使它能独立恢复。
                 if target.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
                     raise RuntimeError("Could not make backup standalone; history was kept")
         # 必须验证可恢复的 SQLite 备份，所有报告也复制成功后，才开始清空。
-        with closing(sqlite3.connect(backup / "inquiry.db")) as check:
+        with _open_database(backup / "inquiry.db", read_only=True) as check:
             if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RuntimeError("Backup verification failed; history was kept")
             if before != {t: check.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
@@ -101,7 +123,7 @@ def clear_history(root, expected_fingerprint=None):
                   "reports_backed_up": len(report_files), "allow_send": False}
         manifest = backup / "result.json"
         manifest.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        with closing(sqlite3.connect(database, timeout=30)) as current, current:
+        with _open_database(database) as current, current:
             current.execute("PRAGMA temp_store=MEMORY")
             current.execute("PRAGMA foreign_keys=ON")
             current.execute("BEGIN IMMEDIATE")
@@ -171,7 +193,7 @@ def main():
     else:
         if args.phase == "pause":
             database = safe_path(root / "data/inquiry.db", root)
-            with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as conn:
+            with _open_database(database, read_only=True) as conn:
                 check_tasks(conn, fingerprint)
         port, rpc_port, call = worker_ui(root, cfg)
         call("api/status")
@@ -190,7 +212,7 @@ def main():
         result = {"ui_port": port, "rpc_port": rpc_port, "manual_ready": True, "allow_send": False,
                   "process_executables": executables}
         if args.phase == "verify":
-            with closing(sqlite3.connect(root / "data/inquiry.db")) as conn:
+            with _open_database(root / "data/inquiry.db", read_only=True) as conn:
                 result["tasks"] = conn.execute("SELECT COUNT(*) FROM task").fetchone()[0]
     print(json.dumps(result, ensure_ascii=True))
 

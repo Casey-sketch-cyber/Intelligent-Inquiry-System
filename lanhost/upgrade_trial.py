@@ -4,12 +4,11 @@ import hashlib
 import json
 import os
 import shutil
-import sqlite3
 import sys
 import time
 import urllib.request
 import uuid
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 try:
@@ -40,7 +39,30 @@ def validate_files(root, package, manifest):
             raise ValueError("Installed source changed; no files overwritten: " + name)
 
 
+@contextmanager
+def _open_database(path, *, read_only=False):
+    from inquiry import db
+
+    guard = getattr(db, "open_existing", None)
+    if guard is not None:
+        with guard(path, read_only=read_only) as conn:
+            yield conn
+        return
+    # 升级包可能只带此脚本。旧工作机通过文件头确认使用回滚日志后才连接。
+    with path.open("rb") as file:
+        versions = file.read(20)[18:20]
+    error = "Installed worker must be updated before this tool can open the business database"
+    if versions != b"\x01\x01":
+        raise RuntimeError(error)
+    mode = "ro" if read_only else "rw"
+    with closing(db.sqlite3.connect(path.as_uri() + f"?mode={mode}", uri=True, timeout=30)) as conn:
+        if conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+            raise RuntimeError(error)
+        yield conn
+
+
 def install(root, package, manifest):
+    from inquiry import db
     from ui import service
     with ExitStack() as stack:
         for name in ("ui_server.lock", "runner.lock"):
@@ -49,14 +71,14 @@ def install(root, package, manifest):
                 raise RuntimeError("Worker or QQ operation is still active; no source was updated")
             stack.enter_context(lock)
         validate_files(root, package, manifest)
-        backup = safe_path(root / "data/backups" / ("trial-upgrade-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]), root)
-        backup.mkdir(parents=True)
-        with closing(sqlite3.connect((root / "data/inquiry.db").as_uri() + "?mode=ro", uri=True)) as src:
-            with closing(sqlite3.connect(backup / "inquiry.db")) as dst:
+        with _open_database(root / "data/inquiry.db", read_only=True) as src:
+            backup = safe_path(root / "data/backups" / ("trial-upgrade-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]), root)
+            backup.mkdir(parents=True)
+            with closing(db.sqlite3.connect(backup / "inquiry.db")) as dst:
                 src.backup(dst)
                 if dst.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
                     raise RuntimeError("Database backup could not be stored as a standalone file")
-        with closing(sqlite3.connect(backup / "inquiry.db")) as conn:
+        with _open_database(backup / "inquiry.db", read_only=True) as conn:
             if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RuntimeError("Database backup verification failed; no source was updated")
         originals = {}
@@ -115,7 +137,7 @@ def main():
     manifest = config.read_json(package / "upgrade-manifest.json")
     if args.phase in ("prepare", "install"):
         validate_files(root, package, manifest)
-        with closing(sqlite3.connect((root / "data/inquiry.db").as_uri() + "?mode=ro", uri=True)) as conn:
+        with _open_database(root / "data/inquiry.db", read_only=True) as conn:
             check_tasks(conn, permit["task_fingerprint"])
     if args.phase == "install":
         value = install(root, package, manifest)
