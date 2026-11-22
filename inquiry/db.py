@@ -1,8 +1,17 @@
 """SQLite 存储：询价任务、供应商、聊天消息、解析出的报价。"""
 import json
-import sqlite3
+import sqlite3 as standard_sqlite
+import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from pathlib import Path
+
+try:
+    import pysqlite3 as sqlite3
+except ModuleNotFoundError as error:
+    if error.name != "pysqlite3":
+        raise
+    sqlite3 = standard_sqlite
 
 from .settings import DATA_DIR
 
@@ -101,26 +110,77 @@ MIGRATIONS = [
 ]
 
 
+def is_lock_error(error):
+    code = getattr(error, "sqlite_errorcode", 0) & 0xFF
+    return code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or (
+        code == 0 and str(error) in ("database is locked", "database table is locked", "database schema is locked"))
+
+
+def _has_wal_fix(version):
+    # SQLite 3.51.3 修复 WAL 重置竞态，3.50.7 和 3.44.6 含回移补丁。
+    return (version >= (3, 51, 3)
+            or (version[:2] == (3, 50) and version >= (3, 50, 7))
+            or (version[:2] == (3, 44) and version >= (3, 44, 6)))
+
+
+def _configure_journal(conn, timeout):
+    deadline = time.monotonic() + timeout
+    enable_wal = _has_wal_fix(sqlite3.sqlite_version_info)
+    while True:
+        try:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            if not enable_wal:
+                if mode == "wal":
+                    raise sqlite3.OperationalError("当前 SQLite 缺少 WAL 修复，请先安装项目锁定依赖再打开该数据库")
+                return
+            if mode == "wal" or conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal":
+                return
+            raise sqlite3.OperationalError("业务数据库无法启用 WAL")
+        except sqlite3.OperationalError as error:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not is_lock_error(error):
+                raise
+            # 首次切换模式需要独占锁，SQLite 有时会立即报告冲突。
+            time.sleep(min(0.05, remaining))
+
+
 @contextmanager
 def connect(*, timeout=30):
     conn = sqlite3.connect(DB_PATH, timeout=timeout)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA temp_store=MEMORY")
     try:
+        conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        _configure_journal(conn, timeout)
         if conn.execute("PRAGMA user_version").fetchone()[0] < 5:
-            conn.executescript(SCHEMA)
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
             for table, col, typ in MIGRATIONS:
                 if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
-                    try:
-                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
-                    except sqlite3.OperationalError:
-                        if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
-                            raise
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
             conn.execute("PRAGMA user_version=5")
+            conn.commit()
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+def snapshot(source, target):
+    """备份包含已提交 WAL 数据的单文件快照，成功后再替换迁移库。"""
+    if source.resolve() == target.resolve():
+        raise ValueError("备份目录必须不同于业务数据库")
+    with tempfile.TemporaryDirectory(prefix="sqlite-backup-", dir=target.parent) as folder:
+        temporary = Path(folder) / target.name
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=30)) as src:
+            with closing(sqlite3.connect(temporary, timeout=30)) as dst:
+                src.backup(dst)
+                if dst.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+                    raise sqlite3.OperationalError("迁移数据库未能转为单文件快照")
+                if dst.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise sqlite3.OperationalError("迁移数据库完整性校验失败")
+        if any(target.with_name(target.name + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+            raise ValueError("现有迁移数据库仍有关联日志，请关闭后再生成迁移包")
+        temporary.replace(target)
 
 
 def set_ref_price(task_id: int, price: float | None):

@@ -4,7 +4,6 @@ import email.parser
 import hashlib
 import json
 import shutil
-import sqlite3
 import threading
 import tomllib
 import uuid
@@ -39,9 +38,8 @@ def copy_seed(dest):
             shutil.copy2(ROOT / name, dest / name)
     source = DATA_DIR / "inquiry.db"
     if source.is_file():
-        with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as src:
-            with sqlite3.connect(dest / "inquiry.db") as dst:
-                src.backup(dst)
+        from inquiry.db import snapshot
+        snapshot(source, dest / "inquiry.db")
     settings = ROOT / "settings.toml"
     if settings.is_file():
         name = tomllib.loads(settings.read_text(encoding="utf-8")).get("inquiry", {}).get("card_image", "")

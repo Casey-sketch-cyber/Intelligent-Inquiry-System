@@ -1,7 +1,6 @@
 """多个进程共享的型号搜索额度，记录保存在业务数据库。"""
 
 import math
-import sqlite3
 import time
 
 from . import db, settings
@@ -51,9 +50,8 @@ def wait_for_search(part_no, page_no, source, check, *, wait=True):
         check()
         try:
             delay = _reserve(part_no, page_no, source, interval, limit)
-        except sqlite3.OperationalError as exc:
-            code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
-            if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        except db.sqlite3.OperationalError as exc:
+            if not db.is_lock_error(exc):
                 raise
             delay = WAIT_STEP
         if delay <= 0:

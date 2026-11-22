@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import secrets
-import sqlite3
 import time
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -159,7 +158,7 @@ def record(kind, stage, *, severity, task_id=None, supplier_id=None, error=None,
                     handle.write(payload + "\n")
             except OSError:
                 logger.warning("Incident JSONL could not be written")
-    except (OSError, sqlite3.Error, ValueError):
+    except (OSError, db.sqlite3.Error, ValueError):
         logger.warning("Incident could not be stored")
 
 

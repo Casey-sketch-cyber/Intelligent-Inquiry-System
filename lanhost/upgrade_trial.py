@@ -54,6 +54,8 @@ def install(root, package, manifest):
         with closing(sqlite3.connect((root / "data/inquiry.db").as_uri() + "?mode=ro", uri=True)) as src:
             with closing(sqlite3.connect(backup / "inquiry.db")) as dst:
                 src.backup(dst)
+                if dst.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+                    raise RuntimeError("Database backup could not be stored as a standalone file")
         with closing(sqlite3.connect(backup / "inquiry.db")) as conn:
             if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RuntimeError("Database backup verification failed; no source was updated")

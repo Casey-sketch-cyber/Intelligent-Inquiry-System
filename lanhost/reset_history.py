@@ -80,6 +80,9 @@ def clear_history(root, expected_fingerprint=None):
                       for table in (*TABLES, "send_attempt")}
             with closing(sqlite3.connect(backup / "inquiry.db")) as target:
                 source.backup(target)
+                # WAL 模式会随备份复制。只在副本上切换日志模式，使它能独立恢复。
+                if target.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+                    raise RuntimeError("Could not make backup standalone; history was kept")
         # 必须验证可恢复的 SQLite 备份，所有报告也复制成功后，才开始清空。
         with closing(sqlite3.connect(backup / "inquiry.db")) as check:
             if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
