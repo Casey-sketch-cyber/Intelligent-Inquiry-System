@@ -66,3 +66,21 @@ class WebsiteAlertsTests(IsolatedTest):
             self.alerts.poll(stop.is_set)
         self.assertFalse(self.alerts.status()["image_ready"])
         self.assertFalse(self.file.exists())
+
+    def test_background_capture_stops_after_three_failed_attempts_per_alert(self):
+        blocked = {"code": "verification"}, "EDGE-TAB"
+        with patch.object(site_capture, "inspect_browser", return_value=blocked) as inspect, \
+             patch.object(site_capture, "capture_site", return_value=None) as capture, \
+             patch.object(website_alerts.threading, "Thread"):
+            for _ in range(6):
+                self.alerts.poll()
+            self.assertEqual(capture.call_count, 3)
+            self.assertFalse(self.alerts.status()["image_ready"])
+            event = self.alerts.status()["id"]
+            inspect.return_value = ({"code": "ok"}, None)
+            self.alerts.poll()
+            self.assertIsNone(self.alerts.control_target(event))
+            inspect.return_value = blocked
+            self.alerts.poll()
+            self.assertEqual(capture.call_count, 4)
+            self.assertNotEqual(self.alerts.status()["id"], event)

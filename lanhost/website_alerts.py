@@ -9,6 +9,7 @@ from inquiry.runtime import require_d_path
 from . import alert_webhook
 
 POLL_SECONDS = 3
+MAX_CAPTURE_ATTEMPTS = 3
 
 
 @dataclass
@@ -17,6 +18,7 @@ class WebsiteAlert:
     kind: str
     target: str | None
     image_ready: bool = False
+    capture_attempts: int = 0
 
 
 class WebsiteAlerts:
@@ -56,6 +58,13 @@ class WebsiteAlerts:
                     return data
         return None
 
+    def control_target(self, event_id: str) -> tuple[str, str] | None:
+        with self._lock:
+            alert = self._alert
+            if alert and alert.id == event_id and alert.target:
+                return alert.target, alert.kind
+        return None
+
     def poll(self, stopped=lambda: False):
         status, target = site_capture.inspect_browser()
         kind = status["code"]
@@ -75,10 +84,13 @@ class WebsiteAlerts:
                 self._remove_image()
                 alert.target = target
                 alert.image_ready = False
+            capture = bool(target and not alert.image_ready and alert.capture_attempts < MAX_CAPTURE_ATTEMPTS)
+            if capture:
+                alert.capture_attempts += 1
 
         if changed:
             threading.Thread(target=alert_webhook.push, args=(kind,), daemon=True, name="website-alert-webhook").start()
-        if target and not alert.image_ready:
+        if capture:
             data = site_capture.capture_site(target, kind)
             if data and len(data) <= site_capture.MAX_SCREENSHOT_BYTES and data.startswith(b"\xff\xd8"):
                 with self._lock:

@@ -13,7 +13,7 @@ from test_reliability import IsolatedTest
 from inquiry import isolation, qq, db
 from ui import server
 from lanhost import config, controller, worker, package
-from lanhost import alert_webhook, website_alerts
+from lanhost import alert_webhook, manual_website, website_alerts
 from lanhost.transport import Journal, Remote, make_server, check_request
 from vmhost.bridge import BridgeError
 
@@ -137,6 +137,39 @@ class LanTest(IsolatedTest):
             with journal.connect() as conn:
                 self.assertNotIn(secret, str(conn.execute("SELECT body FROM request").fetchall()))
             notify.assert_not_called()
+
+    def test_manual_website_transport_refuses_unpaired_or_repeated_input_and_keeps_no_journal(self):
+        event = uuid.uuid4().hex
+        alerts = Mock()
+        alerts.control_target.side_effect = lambda candidate: ("TAB", "verification") if candidate == event else None
+        session = manual_website.ManualWebsite(alerts, available=lambda: True)
+        picture = Mock(image=b"\xff\xd8\xfffixture\xff\xd9")
+        with patch.object(worker, "MANUAL_WEBSITE", session), \
+             patch.object(manual_website.site_capture, "capture_frame", return_value=picture), \
+             patch.object(manual_website.site_capture, "relay_input", return_value=True) as relay:
+            remote, descriptor, journal = self.start_rpc(worker.handler(self.cfg))
+            self.enterContext(patch.object(controller, "remote", return_value=remote))
+            client = controller.app.test_client()
+            frame_path = "/api/lan/website-alert/frame?event=" + event
+            input_path = "/api/lan/website-alert/input"
+            self.assertEqual(client.get(frame_path, headers={"Sec-Fetch-Site": "cross-site"}).status_code, 403)
+            frame = client.get(frame_path)
+            self.assertEqual(frame.status_code, 200)
+            self.assertEqual(frame.headers["Cache-Control"], "no-store")
+            self.assertEqual(base64.b64decode(frame.json["image"]), picture.image)
+            action = {"kind": "text", "text": "test-user-input"}
+            body = {"event": event, "frame_token": frame.json["frame_token"], "action": action}
+            self.assertEqual(client.post(input_path, json=body).status_code, 403)
+            rogue = Remote(descriptor | {"secret": "a" * 64})
+            with self.assertRaises(BridgeError):
+                rogue.call("POST", "/api/worker/website-alert/input", json.dumps(body).encode(), "application/json")
+            relay.assert_not_called()
+            origin = {"Origin": "http://localhost"}
+            self.assertEqual(client.post(input_path, json=body, headers=origin).json, {"ok": True})
+            self.assertEqual(client.post(input_path, json=body, headers=origin).status_code, 409)
+            relay.assert_called_once_with(picture, action)
+            with journal.connect() as conn:
+                self.assertEqual(conn.execute("SELECT count(*) FROM request").fetchone()[0], 0)
 
     def test_duplicate_request_executes_once_and_changed_payload_is_rejected(self):
         journal = Journal(self.path / "journal.db")
