@@ -6,7 +6,15 @@
   return Array.from(document.querySelectorAll('#resultList > li')).map((row, index) => {
     const company = firstVisible(row, '.result_supply a.result_goCompany');
     const qqs = Array.from(row.querySelectorAll('.result_askPrice a.qqicon')).filter(vis)
-      .map(a => ({ uin: (a.getAttribute('inthref') || '').match(/uin=(\d+)/)?.[1] || '', title: a.getAttribute('mytitle') || '' }))
+      .map(a => {
+        const inthref = a.getAttribute('inthref') || '';
+        return {
+          uin: inthref.match(/uin=(\d+)/)?.[1] || '',
+          title: a.getAttribute('mytitle') || '',
+          inthref,
+          href: a.getAttribute('href') || '',
+        };
+      })
       .filter(q => q.uin);
     const level = firstVisible(row, '.result_askPrice .houziLV');
     return {

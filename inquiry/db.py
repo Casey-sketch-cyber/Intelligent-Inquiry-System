@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS supplier (
     company_url TEXT,
     row_json TEXT,                -- 搜索结果原始行
     qq_uin TEXT,                  -- 用来唤起的 QQ 号
+    qq_launch_json TEXT,          -- 仅内部使用的 QQ 唤起属性
     chat_name TEXT,               -- QQ 里会话的名字
     status TEXT NOT NULL DEFAULT 'pending',
         -- pending 待询价 / sent 已发送 / quoted 已报价 / no_stock 无货 / asking 反问 / failed 唤起或发送失败 / skipped
@@ -105,6 +106,7 @@ MIGRATIONS = [
     ("supplier", "read_error", "TEXT"),
     ("supplier", "last_checked_at", "REAL"),
     ("supplier", "parsed_reply_hash", "TEXT"),
+    ("supplier", "qq_launch_json", "TEXT"),
     ("message", "source_id", "TEXT"),
     ("message", "message_time", "TEXT"),
 ]
@@ -155,12 +157,12 @@ def connect(*, timeout=30):
         conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         conn.execute("PRAGMA temp_store=MEMORY")
         _configure_journal(conn, timeout)
-        if conn.execute("PRAGMA user_version").fetchone()[0] < 5:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 6:
             conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
             for table, col, typ in MIGRATIONS:
                 if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
-            conn.execute("PRAGMA user_version=5")
+            conn.execute("PRAGMA user_version=6")
             conn.commit()
         yield conn
         conn.commit()
@@ -214,12 +216,39 @@ def finish_task(task_id: int, status: str = "done"):
 
 
 def add_supplier(task_id: int, row: dict) -> int | None:
+    contacts = row.get("qqs") or []
+    selected = contacts[0] if contacts else {}
+    link = {key: selected[key] for key in ("inthref", "href") if selected.get(key)}
+    public_row = row
+    if contacts:
+        public_row = {
+            **row,
+            "qqs": [{key: value for key, value in entry.items() if key not in ("inthref", "href")} for entry in contacts],
+        }
     with connect() as c:
         cur = c.execute(
-            "INSERT OR IGNORE INTO supplier(task_id, company, company_url, row_json, qq_uin) VALUES (?,?,?,?,?)",
-            (task_id, row["company"], row.get("companyUrl"), json.dumps(row, ensure_ascii=False), row["qqs"][0]["uin"] if row.get("qqs") else None),
+            "INSERT OR IGNORE INTO supplier(task_id, company, company_url, row_json, qq_uin, qq_launch_json) VALUES (?,?,?,?,?,?)",
+            (task_id, row["company"], row.get("companyUrl"), json.dumps(public_row, ensure_ascii=False),
+             selected.get("uin"), json.dumps(link, ensure_ascii=False) if link else None),
         )
         return cur.lastrowid if cur.rowcount else None
+
+
+def saved_qq_link(task_id: int, company: str, uin: str | None) -> dict | None:
+    if not uin:
+        return None
+    with connect() as c:
+        row = c.execute(
+            "SELECT qq_launch_json FROM supplier WHERE task_id=? AND company=? AND qq_uin=?",
+            (task_id, company, str(uin)),
+        ).fetchone()
+    if not row or not row["qq_launch_json"]:
+        return None
+    try:
+        link = json.loads(row["qq_launch_json"])
+    except (ValueError, TypeError):
+        return None
+    return {**link, "uin": str(uin)} if isinstance(link, dict) else None
 
 
 def update_supplier(supplier_id: int, **fields):
@@ -322,6 +351,7 @@ def task_quotes(task_id: int) -> list[dict]:
     out = []
     for r in rows:
         d = dict(r)
+        d.pop("qq_launch_json", None)
         d["quote"] = json.loads(d.pop("data_json")) if d.get("data_json") else None
         d["row"] = json.loads(d.pop("row_json")) if d.get("row_json") else {}
         out.append(d)

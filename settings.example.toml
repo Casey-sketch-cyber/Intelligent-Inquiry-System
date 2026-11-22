@@ -1,5 +1,7 @@
 # 复制为 settings.toml 后，在界面的「设置」中修改。
 [inquiry]
+# 工作机实机验证前保持关闭。启用后仅在当前搜索标签找不到供应商时尝试已保存的 QQ 链接。
+direct_launch = false
 template = "您好，料号：{part}，数量：{qty}pcs，要求全新原装，请报含税单价、交期、批次，谢谢。"
 card_image = ""
 send_card = false

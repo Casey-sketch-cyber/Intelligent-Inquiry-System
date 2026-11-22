@@ -62,7 +62,9 @@ def conversation(sid):
         row = c.execute("SELECT s.*, t.part_no, t.qty FROM supplier s JOIN task t ON t.id=s.task_id WHERE s.id=?", (sid,)).fetchone()
     if not row:
         raise ValueError("供应商记录不存在")
-    return dict(row)
+    record = dict(row)
+    record.pop("qq_launch_json", None)
+    return record
 
 
 def queue_reply(sid, text, request_id, suggestion=None):
