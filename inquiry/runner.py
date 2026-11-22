@@ -285,24 +285,35 @@ class Runner:
             self.idle(POLL_SECONDS, poll=False)
 
     # ---------- 供应商 ----------
-    def _load_candidate_page(self, context, t, page_no, wait):
+    def _pick_candidates(self, t: Task, rows: list[dict]) -> list[dict]:
+        exclude = ({s["company"] for s in db.suppliers(t.id) if s["status"] != "waiting_search"}
+                   | {r["company"] for r in t.candidates}
+                   | db.recently_asked(t.part_no, float(self.cfg.get("skip_recent_hours", 24))))
+        picked = icnet.candidate_rows(rows, t.part_no, t.qty, self.filter, exclude)
+        return [r for r in picked if self.only in r["company"]] if self.only else picked
+
+    def _load_candidate_page(self, context, t: Task, page_no: int, max_pages: int, wait: bool):
         cache_hours = self.filter.get("search_cache_hours", icnet.DEFAULT_SEARCH_CACHE_HOURS)
         if type(cache_hours) not in (int, float) or not math.isfinite(cache_hours) or cache_hours < 0:
             cache_hours = icnet.DEFAULT_SEARCH_CACHE_HOURS
         key = workbench.part_key(t.part_no)
         now = time.time()
-        if cache_hours and not self.refresh_search:
-            hit = db.read_search_cache(key, page_no, cutoff=now - cache_hours * 3600, now=now)
-            if hit is not None:
-                icnet.check_search_session(context, cancelled=self.stop_requested)
-                return hit
+        if cache_hours and not self.refresh_search and (self.dry_run or page_no == 1):
+            last = page_no if self.dry_run else max_pages
+            cached = db.read_search_cache_pages(key, page_no, last, cutoff=now - cache_hours * 3600, now=now)
+            if len(cached) == last - page_no + 1:
+                rows, price, _ = cached[page_no]
+                # 发信只在所有候选页都有新鲜缓存且均无可询价供应商时跳过网站。
+                if self.dry_run or not self._pick_candidates(t, [row for page, _, _ in cached.values() for row in page]):
+                    icnet.check_search_session(context, cancelled=self.stop_requested)
+                    return rows if self.dry_run else [], price, [page[2] for page in cached.values()], last
 
         prefetch = {} if wait else {"wait": False, "source": "prefetch"}
         self.page, rows = icnet.search(context, t.part_no, page_no, cancelled=self.stop_requested, **prefetch)
         price = icnet.ref_price(self.page) if page_no == 1 else None
         if cache_hours:
             db.save_search_cache(key, page_no, rows, price, time.time())
-        return rows, price, None
+        return rows, price, [], page_no
 
     def load_candidates(self, context, t: Task, *, wait=True) -> bool:
         max_pages = int(self.filter.get("max_pages", 3))
@@ -310,7 +321,7 @@ class Runner:
             return False
         page_no = t.pages_loaded + 1
         try:
-            rows, price, fetched_at = self._load_candidate_page(context, t, page_no, wait)
+            rows, price, cache_times, loaded_through = self._load_candidate_page(context, t, page_no, max_pages, wait)
         except icnet.SearchCancelled:
             return False
         except (icnet.NotLoggedIn, search_pacing.SearchRateLimited):
@@ -319,22 +330,21 @@ class Runner:
             t.pages_loaded = page_no
             log(f"{t.part_no} 第 {page_no} 页加载失败：{e}")
             return False
-        t.pages_loaded = page_no
-        if t.pages_loaded == 1:
+        t.pages_loaded = loaded_through
+        if page_no == 1:
             db.set_ref_price(t.id, price)
-        if fetched_at is not None:
-            t.cached_pages += 1
-            t.oldest_cache_at = fetched_at if t.oldest_cache_at is None else min(t.oldest_cache_at, fetched_at)
-        if page_no == 1 or fetched_at is not None:
+        if cache_times:
+            t.cached_pages += len(cache_times)
+            oldest = min(cache_times)
+            t.oldest_cache_at = oldest if t.oldest_cache_at is None else min(t.oldest_cache_at, oldest)
+        if page_no == 1 or cache_times:
             db.set_search_cache_usage(t.id, t.oldest_cache_at, t.cached_pages)
-        exclude = ({s["company"] for s in db.suppliers(t.id) if s["status"] != "waiting_search"}
-                   | {r["company"] for r in t.candidates}
-                   | db.recently_asked(t.part_no, float(self.cfg.get("skip_recent_hours", 24))))
-        picked = icnet.candidate_rows(rows, t.part_no, t.qty, self.filter, exclude)
-        if self.only:
-            picked = [r for r in picked if self.only in r["company"]]
+        if cache_times and not self.dry_run:
+            log(f"{t.part_no} 缓存覆盖 {len(cache_times)} 页，无可询价供应商")
+            return False
+        picked = self._pick_candidates(t, rows)
         t.candidates.extend(picked)
-        source = "（缓存）" if fetched_at is not None else ""
+        source = "（缓存）" if cache_times else ""
         log(f"{t.part_no} 第 {t.pages_loaded} 页{source}：{len(rows)} 行，可询价 {len(picked)} 家")
         return bool(picked)
 

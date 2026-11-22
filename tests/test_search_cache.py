@@ -1,10 +1,11 @@
 """在隔离库和浏览器替身中验证缓存、刷新和供应商实时核对。"""
 import json
 import uuid
+from contextlib import nullcontext
 from urllib.parse import unquote, urlsplit
 from unittest.mock import Mock, patch
 
-from inquiry import db, icnet, jobs, qq, search_pacing
+from inquiry import db, dispatch, icnet, isolation, jobs, qq, search_pacing
 from inquiry import runner as runner_module
 from inquiry.runner import Runner, Task
 from test_reliability import IsolatedTest
@@ -18,7 +19,7 @@ class SearchCacheTests(IsolatedTest):
     def setUp(self):
         super().setUp()
         self.clock = FakeClock()
-        for module in (runner_module, icnet, search_pacing):
+        for module in (runner_module, dispatch, icnet, search_pacing):
             change = patch.object(module, "time", self.clock)
             change.start()
             self.addCleanup(change.stop)
@@ -38,7 +39,7 @@ class SearchCacheTests(IsolatedTest):
         return [{"company": "测试供应商", "partNo": part, "qty": "10K", "qqs": [{"uin": "12345", "inthref": self.LINK}]}]
 
     def load(self, part="PART-A", *, refresh=False, hours=4):
-        runner = Runner([], refresh_search=refresh)
+        runner = Runner([], dry_run=True, refresh_search=refresh)
         runner.filter = {"search_cache_hours": hours}
         task = Task(db.create_task(part, 5000), part, 5000, "试验")
         self.assertTrue(runner.load_candidates(self.context, task))
@@ -100,7 +101,7 @@ class SearchCacheTests(IsolatedTest):
         self.assertEqual(len(requested), 5)
         self.assertTrue(any("PART%2FA" in url for url in requested))
 
-        runner = Runner([])
+        runner = Runner([], dry_run=True)
         runner.filter = {"search_cache_hours": 4}
         task = Task(db.create_task("PART", 5000), "PART", 5000, "试验", pages_loaded=1)
         self.assertTrue(runner.load_candidates(self.context, task))
@@ -109,7 +110,7 @@ class SearchCacheTests(IsolatedTest):
 
     def test_cache_hits_pause_for_manual_captcha_or_login(self):
         self.load()
-        runner = Runner([])
+        runner = Runner([], dry_run=True)
         runner.filter = {"search_cache_hours": 4}
         task = Task(db.create_task("PART-A", 5000), "PART-A", 5000, "试验")
         for url in ("https://www.ic.net.cn/searchPnCode.php", "https://member.ic.net.cn/login"):
@@ -183,3 +184,98 @@ class SearchCacheTests(IsolatedTest):
              patch.object(runner, "load_candidates", side_effect=finish) as load:
             runner.send_in_order(Mock())
         self.assertEqual(load.call_count, 2)
+
+    def run_batch(self, part, *, hours=4, max_pages=3, dry_run=False):
+        context = BrowserFixture(self.clock)
+        active_chat = None
+        history = []
+
+        def launch(page, row, **_):
+            nonlocal active_chat
+            self.assertEqual(page.part, part)
+            active_chat = row["company"]
+            return Mock(url="https://qidian.qq.com/")
+
+        def send(_window, text, *, expect_chat, company):
+            self.assertEqual(expect_chat, active_chat)
+            history.append({"id": "simulated-message", "text": text, "self": True})
+            context.events.append(("send", part, company, self.clock.now))
+
+        config = {"inquiry": {"template": "请报 {part}，数量 {qty}", "send_card": False},
+                  "filter": {"max_pages": max_pages, "search_cache_hours": hours}}
+        request = {"request_id": uuid.uuid4().hex, "parts": [{"part": part, "qty": 5000}], "max": 1,
+                   "dry_run": dry_run}
+        job = jobs.submit(request, config)
+        with patch.object(isolation, "ENABLED", False), \
+             patch.object(runner_module, "sync_playwright", return_value=nullcontext(Mock())), \
+             patch.object(runner_module.browser_mod, "connect", return_value=(None, context)), \
+             patch.object(runner_module.report, "build", return_value="测试报告"), \
+             patch.object(Runner, "wait_for_qq", return_value=True), \
+             patch.object(qq, "require_assisted_foreground"), \
+             patch.object(qq, "verify_supplier"), \
+             patch.object(qq, "wait_layout_stable"), \
+             patch.object(qq, "current_chat_name", side_effect=lambda _: active_chat), \
+             patch.object(qq, "wait_chat_change", side_effect=lambda *args, **kw: active_chat), \
+             patch.object(qq, "read_messages", side_effect=lambda _: list(history)), \
+             patch.object(qq, "send_text", side_effect=send), \
+             patch.object(icnet, "load_ok_origins", return_value={"qidian.qq.com"}), \
+             patch.object(icnet, "launch_qq", side_effect=launch):
+            jobs.execute(job["id"])
+
+        self.assertEqual(jobs.get(job["id"])["status"], "done")
+        task = Task(job["task_ids"][0], part, 5000, "")
+        return [event[:3] for event in context.events], self.metadata(task), db.suppliers(task.id)
+
+    def test_normal_batch_searches_live_with_positive_cache_as_with_disabled_cache(self):
+        for part, hours in (("MODEL0", 4), ("MODEL1", 0)):
+            with self.subTest(hours=hours):
+                self.save_positive_cache(part)
+                for page in (2, 3):
+                    db.save_search_cache(part, page, [], None, self.clock.now)
+                current = f"测试 {part} 供货商 0"
+                events, metadata, suppliers = self.run_batch(part, hours=hours)
+                self.assertEqual(events, [("search", part, 1), ("send", part, current)])
+                self.assertEqual(metadata[:2], (None, 0))
+                self.assertEqual([(entry["company"], entry["status"]) for entry in suppliers], [(current, "sent")])
+
+    def save_positive_cache(self, part):
+        row = {"company": "缓存中的过时供应商", "partNo": part, "page": 1, "qty": "10K", "batch": "25+",
+               "date": "01-01", "qtyNum": 10_000, "qqs": [{"uin": "99999"}]}
+        db.save_search_cache(part, 1, [row], 12.5, self.clock.now)
+
+    def test_dry_run_batch_uses_positive_cache_without_navigation(self):
+        part = "MODEL0"
+        self.save_positive_cache(part)
+
+        events, metadata, suppliers = self.run_batch(part, dry_run=True)
+
+        self.assertEqual(events, [])
+        self.assertEqual(metadata, (self.clock.now, 1, 12.5))
+        self.assertEqual(suppliers, [])
+
+    def test_normal_batch_skips_search_with_all_candidate_pages_known_empty(self):
+        part = "MODEL0"
+        oldest = self.clock.now - 60
+        db.save_search_cache(part, 1, [], 12.5, oldest)
+        db.save_search_cache(part, 2, [{"company": "无 QQ 的供应商", "partNo": part, "qqs": []}],
+                             None, self.clock.now)
+
+        events, metadata, suppliers = self.run_batch(part, max_pages=2)
+
+        self.assertEqual(events, [])
+        self.assertEqual(metadata, (oldest, 2, 12.5))
+        self.assertEqual(suppliers, [])
+
+    def test_normal_batch_searches_live_if_any_candidate_page_missing_or_expired(self):
+        for part, expired_page in (("MODEL0", False), ("MODEL1", True)):
+            with self.subTest(expired_page=expired_page):
+                db.save_search_cache(part, 1, [], 12.5, self.clock.now)
+                if expired_page:
+                    db.save_search_cache(part, 2, [], None, self.clock.now - 4 * 3600)
+
+                events, metadata, suppliers = self.run_batch(part, max_pages=2)
+
+                current = f"测试 {part} 供货商 0"
+                self.assertEqual(events, [("search", part, 1), ("send", part, current)])
+                self.assertEqual(metadata[:2], (None, 0))
+                self.assertEqual([entry["company"] for entry in suppliers], [current])
