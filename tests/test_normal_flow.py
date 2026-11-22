@@ -4,7 +4,7 @@ import time
 import uuid
 from unittest.mock import patch, Mock
 import test_lan
-from inquiry import db, jobs, collection, isolation, qq, icnet
+from inquiry import db, jobs, collection, isolation, qq, icnet, selfcheck
 from inquiry.runner import Runner, Task
 from ui import server
 from lanhost import config, worker
@@ -57,7 +57,8 @@ class NormalFlowTest(test_lan.LanTest):
                 jobs.dispatch_one()
                 self.assertEqual(jobs.get(job['id'])['status'],'waiting_verification')
                 spawn.assert_not_called()
-            with patch.object(server,'browser_status',return_value={'code':'ok'}):
+            with patch.object(server,'browser_status',return_value={'code':'ok'}), \
+                 patch.object(selfcheck, "snapshot", return_value={"ok": True, "text": "QQ 自检通过"}):
                 jobs.dispatch_one()
                 self.assertEqual(jobs.get(job['id'])['status'],'queued')
                 self.assertEqual(spawn.call_args.kwargs['module'],'inquiry.jobs')

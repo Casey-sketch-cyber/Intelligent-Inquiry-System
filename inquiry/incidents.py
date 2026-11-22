@@ -30,7 +30,7 @@ LABELS = {
 STAGES = {"search", "queue", "qq_launch", "inquiry_send", "collection", "qq_controls",
           "analysis", "reply_send", "suggestions", "recovery"}
 SEVERITIES = {"info", "warning", "error"}
-CONTROLS = {"editor", "send_button", "message_list", "conversation_list"}
+CONTROLS = {"qq_window", "editor", "send_button", "message_list", "conversation_list"}
 logger = logging.getLogger(__name__)
 
 

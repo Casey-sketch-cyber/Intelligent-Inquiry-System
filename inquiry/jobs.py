@@ -69,7 +69,9 @@ def recover():
 def cancel(jid):
     with db.connect() as c:
         c.execute("BEGIN IMMEDIATE")
-        changed = c.execute("UPDATE inquiry_job SET status='stopped',finished_at=?,error='用户已取消此批次' WHERE id=? AND status IN ('queued','waiting_verification','interrupted','failed')", (time.time(), jid)).rowcount
+        changed = c.execute("UPDATE inquiry_job SET status='stopped',finished_at=?,error='用户已取消此批次' "
+                            "WHERE id=? AND status IN ('queued','waiting_verification','waiting_member_login',"
+                            "'waiting_selfcheck','interrupted','failed')", (time.time(), jid)).rowcount
         if not changed:
             raise ValueError("此批次已开始或已结束；运行中的任务请使用安全停止")
         dry_run = json.loads(c.execute("SELECT payload FROM inquiry_job WHERE id=?",(jid,)).fetchone()[0])["request"]["dry_run"]
@@ -87,6 +89,25 @@ def resume(jid):
         c.execute("UPDATE task SET status='queued',finished_at=NULL WHERE batch_id=? AND status NOT IN ('done','dry-run')", (jid,))
 
 
+def _prepare_normal_job(jid):
+    from . import selfcheck
+    if not isolation.ALLOW_SEND:
+        return False
+    result = selfcheck.snapshot()
+    status = "queued" if result["ok"] else "waiting_selfcheck"
+    error = None if result["ok"] else result["text"]
+    with db.connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        current = c.execute("SELECT status FROM inquiry_job WHERE id=?", (jid,)).fetchone()
+        if not current or current["status"] not in ("queued", "waiting_selfcheck"):
+            return False
+        c.execute("UPDATE inquiry_job SET status=?,error=? WHERE id=? AND (status<>? OR error IS NOT ?)",
+                  (status, error, jid, status, error))
+        c.execute("UPDATE task SET status=? WHERE batch_id=? AND status IN ('queued','waiting_selfcheck') AND status<>?",
+                  (status, jid, status))
+    return result["ok"]
+
+
 def dispatch_one():
     from ui import server
     if isolation.MANUAL.is_set() or isolation.DRAINING.is_set() or server.STOP_FILE.exists():
@@ -98,21 +119,38 @@ def dispatch_one():
         code = state.get("code")
         if code in ("verification", "login"):
             with db.connect() as c:
-                changed = c.execute("UPDATE inquiry_job SET status='waiting_verification',error=? WHERE status='queued'", ("请在第二台完成网站登录或验证码；本批次没有重新搜索",)).rowcount
-                c.execute("UPDATE task SET status='waiting_verification' WHERE status='queued' AND batch_id IN (SELECT id FROM inquiry_job WHERE status='waiting_verification')")
+                changed = c.execute("UPDATE inquiry_job SET status='waiting_verification',error=? "
+                                    "WHERE status IN ('queued','waiting_selfcheck')",
+                                    ("请在第二台完成网站登录或验证码；本批次没有重新搜索",)).rowcount
+                c.execute("UPDATE task SET status='waiting_verification' WHERE status IN ('queued','waiting_selfcheck') "
+                          "AND batch_id IN (SELECT id FROM inquiry_job WHERE status='waiting_verification')")
             if changed:
                 incidents.record("captcha" if code == "verification" else "login_required", "queue", severity="warning")
             return
         with db.connect() as c:
+            if c.execute("SELECT 1 FROM inquiry_job WHERE status='waiting_member_login' LIMIT 1").fetchone():
+                if code != "ok" or state.get("member_portal_open"):
+                    return  # 不消耗搜索配额反复打开同一个会员跳转页。
+                c.execute("UPDATE inquiry_job SET status='queued',error=NULL WHERE status='waiting_member_login'")
+                c.execute("UPDATE task SET status='queued' WHERE status='waiting_member_login' "
+                          "AND batch_id IN (SELECT id FROM inquiry_job WHERE status='queued')")
             c.execute("UPDATE inquiry_job SET status='queued',error=NULL WHERE status='waiting_verification'")
             c.execute("UPDATE task SET status='queued' WHERE status='waiting_verification' AND batch_id IN (SELECT id FROM inquiry_job WHERE status='queued')")
-            row = c.execute("SELECT id,payload FROM inquiry_job WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+            row = c.execute("SELECT id,payload,status FROM inquiry_job WHERE status IN ('queued','waiting_selfcheck') "
+                            "ORDER BY created_at LIMIT 1").fetchone()
         if row:
             request = json.loads(row["payload"])["request"]
-            if not request["dry_run"] and not isolation.ALLOW_SEND:
-                return
-            server.spawn(["--job", row["id"]], "dry-run" if request["dry_run"] else "run",
-                         "、".join(p[0] for p in request["parts"]), module="inquiry.jobs")
+            if not request["dry_run"] and not _prepare_normal_job(row["id"]):
+                # 只搜索的试运行不依赖 QQ，仍可在实发批次等待时执行。
+                with db.connect() as c:
+                    row = c.execute("SELECT id,payload FROM inquiry_job WHERE status='queued' "
+                                    "AND json_extract(payload,'$.request.dry_run')=1 ORDER BY created_at LIMIT 1").fetchone()
+                if not row:
+                    return
+                request = json.loads(row["payload"])["request"]
+            if not (isolation.MANUAL.is_set() or isolation.DRAINING.is_set() or server.STOP_FILE.exists()):
+                server.spawn(["--job", row["id"]], "dry-run" if request["dry_run"] else "run",
+                             "、".join(p[0] for p in request["parts"]), module="inquiry.jobs")
 
 
 def start_pump():
@@ -130,7 +168,7 @@ def start_pump():
 
 def execute(jid):
     from .runner import Runner, Task, log, render_message
-    from . import dispatch, icnet
+    from . import dispatch, icnet, selfcheck
     from ui import service, server
     lock = service.acquire_lock(server.LOCK_FILE)
     if lock is None:
@@ -176,15 +214,20 @@ def execute(jid):
             uncertain = any(s["status"] in ("sending", "send_uncertain") for t in runner.tasks for s in db.suppliers(t.id))
             status = "interrupted" if uncertain else ("stopped" if runner._stop else "done")
             error = "存在发送结果待核实项，已停止后续发送" if uncertain else None
+        except icnet.MemberPortalRedirect as exc:
+            status, error = "waiting_member_login", str(exc)
         except icnet.NotLoggedIn as exc:
             status, error = "waiting_verification", str(exc)
+        except selfcheck.SelfcheckDeferred as exc:
+            status, error = "waiting_selfcheck", str(exc)
         except Exception as exc:
             status, error = "failed", str(exc)[:400]
             log("询价批次未完成：" + error)
         with db.connect() as c:
             c.execute("UPDATE inquiry_job SET status=?,finished_at=?,error=? WHERE id=?", (status, time.time(), error, jid))
-            if status == "waiting_verification":
-                c.execute("UPDATE task SET status='waiting_verification',finished_at=NULL WHERE batch_id=? AND status NOT IN ('done','dry-run')", (jid,))
+            if status in ("waiting_verification", "waiting_member_login", "waiting_selfcheck"):
+                c.execute("UPDATE task SET status=?,finished_at=NULL WHERE batch_id=? AND status NOT IN ('done','dry-run')",
+                          (status, jid))
     finally:
         lock.close()
 

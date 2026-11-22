@@ -20,7 +20,7 @@ MANUAL_WEBSITE = None
 
 
 def state(cfg):
-    from inquiry import isolation, collection
+    from inquiry import isolation, collection, selfcheck
     from ui import server
     from lanhost import live_trial
     trial = live_trial.active_status()
@@ -32,6 +32,7 @@ def state(cfg):
             "collection": collection.status(),
             "website_alert": WEBSITE_ALERTS.status() if WEBSITE_ALERTS else None,
             "manual_website_support": MANUAL_WEBSITE is not None,
+            "selfcheck": selfcheck.latest(),
             "normal_capability": 1, "support_capability": 1, **trial}
 
 
@@ -223,11 +224,17 @@ def main():
     config.save_json(config.LAN_DIR / "worker-ui.json", {"url": local_url, "port": httpd.server_port})
     ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
     server.start_background_services()
-    from inquiry import jobs
+    from inquiry import jobs, selfcheck
     from lanhost import live_trial
     from lanhost.manual_website import ManualWebsite
     from lanhost.website_alerts import WebsiteAlerts
     jobs.start_pump()
+    def check_qq():
+        while not isolation.DRAINING.is_set():
+            selfcheck.snapshot()
+            isolation.DRAINING.wait(10)
+
+    threading.Thread(target=check_qq, daemon=True, name="worker-qq-selfcheck").start()
     WEBSITE_ALERTS = WebsiteAlerts(config.LAN_DIR / "website-alert.jpg")
     MANUAL_WEBSITE = ManualWebsite(WEBSITE_ALERTS, available=lambda: not (
         isolation.DRAINING.is_set() or server.run_state()["running"] or live_trial.active_status()["trial_running"]

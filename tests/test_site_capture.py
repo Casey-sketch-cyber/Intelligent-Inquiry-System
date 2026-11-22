@@ -42,7 +42,7 @@ class SiteCaptureTests(unittest.TestCase):
             "https://web.qq.com/",
         ]
         with patch.object(site_capture, "_cdp_json", return_value=[target("other", url) for url in sites]):
-            self.assertEqual(site_capture.inspect_browser(), (site_capture.STATUSES["ok"], None))
+            self.assertEqual(site_capture.inspect_browser(), (site_capture.STATUSES["ok"] | {"member_portal_open": True}, None))
             with patch.object(site_capture, "async_playwright") as attach:
                 self.assertIsNone(site_capture.capture_site("other", "verification"))
                 attach.assert_not_called()

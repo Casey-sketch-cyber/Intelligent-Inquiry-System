@@ -24,6 +24,13 @@ class NotLoggedIn(RuntimeError):
     pass
 
 
+class MemberPortalRedirect(NotLoggedIn):
+    """搜索跳到了未经授权远程操作的 IC 会员页面，需要线下处理。"""
+
+
+MEMBER_PORTAL_WAIT_TEXT = "搜索跳转到 IC交易网会员页面，请在第二台核对登录并关闭该会员页面"
+
+
 class SearchCancelled(RuntimeError):
     pass
 
@@ -157,6 +164,9 @@ def search(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1,
     page = search_page(context, part_no, page_no)
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     _raise_search_block(site_capture.page_kind(page.url))
+    if site_capture.is_member_portal(page.url):
+        incidents.record("login_required", "search", severity="warning")
+        raise MemberPortalRedirect(MEMBER_PORTAL_WAIT_TEXT)
     if _result_part(page.url) != part_no.strip().upper() or _result_page_no(page.url) != page_no:
         raise RuntimeError("IC交易网返回的型号或页码与请求不一致")
     page.wait_for_selector("#resultList > li", timeout=30000)

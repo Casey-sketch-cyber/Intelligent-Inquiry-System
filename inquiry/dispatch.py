@@ -38,6 +38,8 @@ def recover_interrupted():
 
 
 def process_one(win, pacing, cancelled=lambda: False):
+    from . import isolation, selfcheck
+
     if cancelled() or rate_delay(pacing) > 0:
         return False
     with db.connect() as c:
@@ -48,6 +50,8 @@ def process_one(win, pacing, cancelled=lambda: False):
     oid, sid = item["id"], item["supplier_id"]
     invoked = False
     try:
+        if isolation.ENABLED and isolation.MODE == "worker":
+            selfcheck.require_ready(win=win)
         target = workbench.conversation(sid)
         if any(item[k] != target[k] for k in ("company", "chat_name", "qq_uin")):
             raise SupplierIdentityError("会话绑定已变化，请重新核对后提交")
@@ -72,7 +76,7 @@ def process_one(win, pacing, cancelled=lambda: False):
             c.execute("INSERT INTO message(supplier_id,direction,content,seen_at) VALUES(?,'out',?,?)", (sid, item["content"], time.time()))
             c.execute("UPDATE outbox SET status='sent',updated_at=?,error=NULL WHERE id=?", (time.time(), oid))
         return True
-    except qq.DesktopDeferred as e:
+    except (qq.DesktopDeferred, selfcheck.SelfcheckDeferred) as e:
         status, error = "deferred", str(e)
         if isinstance(e, qq.EditorUnavailable) and item.get("error") != error[:300]:
             incidents.record("uia_control_missing", "qq_controls", severity="warning", supplier_id=sid,
@@ -93,10 +97,13 @@ def process_one(win, pacing, cancelled=lambda: False):
 
 
 def run_worker():
+    from . import isolation, selfcheck
     from .settings import SETTINGS
     from .runner import STOP_FILE
     recover_interrupted()
     try:
+        if isolation.ENABLED and isolation.MODE == "worker":
+            selfcheck.require_ready()
         win = qq.ready_main_window()
     except Exception as e:
         with db.connect() as c:

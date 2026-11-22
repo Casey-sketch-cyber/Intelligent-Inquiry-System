@@ -52,12 +52,8 @@ def qq_windows() -> list:
     return [w for w in auto.GetRootControl().GetChildren() if exe_of(w.ProcessId).lower().endswith("\\qq.exe")]
 
 
-def main_window():
-    """QQ 主窗口。找不到返回 None。
-
-    QQ 有好几个标题都叫 "QQ" 的顶层窗口（隐藏的辅助窗口、小窗口），只能按"可见、够大、里面有会话列表"来认。
-    不显示隐藏窗口。普通模式不恢复最小化窗口；配对的虚拟机可恢复自己的 QQ 主窗口。
-    """
+def _main_window_handles():
+    """只枚举可见且尺寸符合 QQ 主窗口的候选句柄。"""
     found = []
 
     def cb(hwnd, _):
@@ -65,17 +61,38 @@ def main_window():
                 and win32gui.IsWindowVisible(hwnd)):
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             if exe_of(pid).lower().endswith("\\qq.exe"):
-                found.append(hwnd)
+                rect = win32gui.GetWindowPlacement(hwnd)[4] if win32gui.IsIconic(hwnd) else win32gui.GetWindowRect(hwnd)
+                l, t, r, b = rect
+                if r - l >= 400 and b - t >= 300:
+                    found.append(hwnd)
         return True
 
     win32gui.EnumWindows(cb, None)
-    for hwnd in found:
+    return found
+
+
+def passive_main_window():
+    """读取未最小化的 QQ 主窗口，保留没有暴露会话列表的候选供自检。"""
+    fallback = None
+    for hwnd in _main_window_handles():
         if win32gui.IsIconic(hwnd):
-            l, t, r, b = win32gui.GetWindowPlacement(hwnd)[4]  # 最小化前的位置
-        else:
-            l, t, r, b = win32gui.GetWindowRect(hwnd)
-        if r - l < 400 or b - t < 300:
             continue
+        try:
+            win = auto.ControlFromHandle(hwnd)
+            if fallback is None:
+                fallback = win
+            if find(win, "recent-contact-list") is not None:
+                return win
+            if warm_up(win, 1) and find(win, "recent-contact-list") is not None:
+                return win
+        except Exception:
+            continue
+    return fallback
+
+
+def main_window():
+    """读取具备会话列表的 QQ 主窗口。独立环境可恢复窗口。"""
+    for hwnd in _main_window_handles():
         if win32gui.IsIconic(hwnd):
             from . import isolation
             if not isolation.ENABLED or isolation.MANUAL.is_set() or isolation.DRAINING.is_set():
