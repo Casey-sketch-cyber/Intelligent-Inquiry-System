@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
@@ -71,6 +72,33 @@ def status():
         return jsonify(online=False, paired=False, text="等待导入 QQ 工作机的连接文件")
     result = remote().status()
     return jsonify(result | {"paired": True})
+
+
+@app.get("/api/lan/website-alert/image")
+def website_alert_image():
+    if request.headers.get("Sec-Fetch-Site") not in (None, "none", "same-origin"):
+        return Response(status=403)
+    events = request.args.getlist("event")
+    if len(events) != 1 or not re.fullmatch(r"[0-9a-f]{32}", events[0]) or len(request.args) != 1:
+        return Response(status=404)
+    code, headers, body = remote().call("GET", f"/api/worker/website-alert/image?event={events[0]}")
+    if code != 200:
+        return Response(status=code)
+    if next((value for key, value in headers.items() if key.lower() == "content-type"), "") != "image/jpeg":
+        return Response(status=502)
+    return Response(body, mimetype="image/jpeg", headers={
+        "Cross-Origin-Resource-Policy": "same-origin", "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.route("/api/lan/website-alert/settings", methods=["GET", "PUT"])
+def website_alert_settings():
+    body = request.get_data()
+    if len(body) > 2048:
+        return jsonify(error="提醒设置内容过大"), 400
+    code, _, result = remote().call("GET" if request.method == "HEAD" else request.method,
+                                    "/api/worker/website-alert/settings", body, request.content_type or "")
+    return Response(result, status=code, mimetype="application/json")
 
 
 @app.post("/api/lan/import")

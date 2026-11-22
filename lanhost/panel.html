@@ -1,8 +1,30 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>双机工作台 · 天芯智能询价</title><link rel="icon" href="data:,">
 <style>*{box-sizing:border-box}body{margin:0;background:#f4f6fb;color:#12223e;font:15px/1.65 "Segoe UI","Microsoft YaHei",sans-serif}header{padding:18px 28px;background:#fff;border-bottom:1px solid #dde4ef;display:flex;align-items:center;gap:18px;flex-wrap:wrap}h1{font-size:21px;margin:0}button,.button{border:1px solid #d6dfec;background:white;color:#294776;border-radius:9px;padding:9px 15px;font:inherit;cursor:pointer}button.primary{background:#315ff5;color:white;border-color:#315ff5}button:disabled{opacity:.5;cursor:wait}.badge{color:#9a6700;background:#fff3d7;border-radius:15px;padding:3px 12px}.note{padding:10px 28px;margin:0;background:#edf2fd;color:#526986}#feedback{padding:0 28px;color:#b42318;white-space:pre-wrap}#welcome{max-width:800px;margin:46px auto;background:white;border:1px solid #dfe5ee;border-radius:18px;padding:30px}h2{font-size:22px;margin-top:0}.muted{color:#64738a}#buildResult{white-space:pre-wrap;overflow-wrap:anywhere}iframe{border:0;width:100%;height:calc(100vh - 150px);display:none}input[type=file]{max-width:100%;margin:8px 0 18px}.actions{display:flex;gap:12px;flex-wrap:wrap}details{margin-top:24px;padding-top:16px;border-top:1px solid #e6eaf0}#connectedTools{margin-left:auto;display:flex;gap:10px}</style>
+<style>
+#websiteAlert{margin:16px 28px;padding:18px 22px;background:#fff8e8;border:1px solid #eed7a5;border-radius:12px}
+.website-alert-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(200px,520px);gap:20px;align-items:start}
+#websiteAlert h2{font-size:18px;margin:0 0 6px}#websiteAlert p{margin:0 0 10px}
+#websiteAlert figure{margin:0;min-width:0}#websiteAlertImage{max-width:100%;max-height:32vh;object-fit:contain;border:1px solid #eed7a5;border-radius:8px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+@media(max-width:760px){.website-alert-body{grid-template-columns:1fr}#websiteAlert{margin:12px 16px;padding:14px 16px}}
+</style>
 <header><h1>天芯 · 双机工作台</h1><span id="status">正在检查连接…</span><span class="badge" id="sendMode">正在检查实发模式…</span><div id="connectedTools"><button id="enableSending">开放常规实发</button><button id="collectReplies" class="primary">收集回复</button><button id="pauseCollectReplies" disabled>暂停收集回复</button><button id="resume" class="primary">恢复自动执行</button><button id="pause">暂停全部操作</button></div></header>
 <p class="note" id="note">办公电脑查看和管理任务，QQ 工作机执行操作。两台电脑都需保持开机联网。</p><p id="feedback" role="status"></p>
+<div id="websiteAlertAnnouncement" class="sr-only" role="alert"></div>
+<section id="websiteAlert" aria-labelledby="websiteAlertTitle" hidden>
+  <div class="website-alert-body">
+    <div>
+      <h2 id="websiteAlertTitle"></h2>
+      <p id="websiteAlertInstructions"></p>
+      <button id="enableWebsiteAlerts" type="button" hidden></button>
+    </div>
+    <figure>
+      <img id="websiteAlertImage" alt="工作机上待人工处理的 IC交易网页面截图" hidden>
+      <figcaption id="websiteAlertImageStatus" class="muted"></figcaption>
+    </figure>
+  </div>
+</section>
 <section id="connectionProblem" hidden style="margin:20px 28px;padding:18px 22px;background:#fff8e8;border:1px solid #eed7a5;border-radius:12px" role="status"><strong id="connectionTitle">正在重新连接 QQ 工作机</strong><p id="connectionDetail"></p><p>页面会自动重新检查连接。这里只重试连接状态，不会重新提交询价或发送消息。</p><button id="retryConnection">立即重连</button> <button id="changeConnection">更新连接文件</button></section>
 <main id="welcome" hidden><h2 id="welcomeTitle">连接你的 QQ 工作机</h2><ol id="setupInstructions"><li>将工作机安装包复制到第二台 Windows 电脑的 D 盘，解压并运行「1_安装QQ工作机.cmd」。</li><li>在工作机登录 QQ 和 IC交易网，按包内说明允许本局域网连接。</li><li>把工作机生成的「办公电脑连接.json」复制回本电脑，在下方导入。</li></ol><label for="connection">导入工作机连接文件</label><br><input id="connection" type="file" accept=".json,application/json"><button class="primary" id="import">验证并连接</button><p class="muted">文件包含本企业的配对凭据，请保存在 D 盘。工作机更换网络地址后，可在工作机更新连接文件并重新导入。</p>
 <details id="deployment"><summary>生成工作机安装包</summary><p>先在办公电脑生成安装包，再复制到本企业的第二台电脑。</p><label><input id="withData" type="checkbox"> 包含本机已有型号、设置和模型密钥（仅供本企业迁移）</label><p><button id="build">生成 D 盘部署包</button></p><p id="buildResult" class="muted"></p></details></main>
@@ -11,6 +33,124 @@
 let shown=false,busy=false,lastStatus=null,knownPaired=null,editingConnection=false,refreshing=null;
 const el=id=>document.getElementById(id);
 async function call(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});const value=await r.json();if(!r.ok)throw Error(value.error||'操作失败');return value}
+const websiteAlertCopy={
+  login:{title:'IC交易网需要登录',instructions:'请到第二台电脑，在系统专用 Edge 浏览器中登录 IC交易网。'},
+  verification:{title:'IC交易网需要人工校验',instructions:'请到第二台电脑，在系统专用 Edge 浏览器中完成验证码。'}
+};
+const announcedWebsiteAlerts=new Set();
+let currentWebsiteAlert=null,desktopWebsiteAlert=null,websiteAlertAudio=null;
+
+function announceOnce(channel,id,deliver){
+  const key='website-alert:'+channel+':'+id;
+  if(announcedWebsiteAlerts.has(key))return;
+  announcedWebsiteAlerts.add(key);
+  try{
+    if(sessionStorage.getItem(key))return;
+    sessionStorage.setItem(key,'1');
+  }catch(_){/* 浏览器禁用存储时，当前页面仍保留去重状态。 */}
+  try{deliver()}catch(_){/* 设备提醒不可用时，继续显示页面提醒。 */}
+}
+
+function deliverWebsiteAlert(alert){
+  const copy=websiteAlertCopy[alert.kind];
+  announceOnce('page',alert.id,()=>{
+    el('websiteAlertAnnouncement').textContent=copy.title+'。'+copy.instructions;
+  });
+  if(window.Notification?.permission==='granted'){
+    announceOnce('desktop',alert.id,()=>{
+      desktopWebsiteAlert=new Notification(copy.title,{body:copy.instructions,tag:'website-alert-'+alert.id,silent:true});
+    });
+  }
+  if(websiteAlertAudio?.state==='running'){
+    announceOnce('sound',alert.id,()=>{
+      const audio=websiteAlertAudio,oscillator=audio.createOscillator(),gain=audio.createGain();
+      const start=audio.currentTime;
+      oscillator.frequency.value=740;
+      gain.gain.setValueAtTime(.09,start);
+      gain.gain.exponentialRampToValueAtTime(.001,start+.18);
+      oscillator.connect(gain);
+      gain.connect(audio.destination);
+      oscillator.start(start);
+      oscillator.stop(start+.18);
+    });
+  }
+}
+
+function updateWebsiteAlertButton(){
+  const desktop=window.Notification?.permission==='default';
+  const audio=typeof window.AudioContext==='function'&&websiteAlertAudio?.state!=='running';
+  const button=el('enableWebsiteAlerts');
+  button.hidden=!desktop&&!audio;
+  button.textContent=desktop?(audio?'启用桌面提醒和提示音':'启用桌面提醒'):'启用提示音';
+}
+
+el('enableWebsiteAlerts').onclick=async()=>{
+  const button=el('enableWebsiteAlerts'),requests=[];
+  button.disabled=true;
+  try{
+    if(typeof window.AudioContext==='function'){
+      try{
+        websiteAlertAudio ||= new AudioContext();
+        if(websiteAlertAudio.state!=='running')requests.push(websiteAlertAudio.resume());
+      }catch(_){/* 浏览器可能限制声音。 */}
+    }
+    if(window.Notification?.permission==='default'){
+      try{requests.push(Notification.requestPermission())}catch(_){/* 浏览器可能禁止请求权限。 */}
+    }
+    await Promise.allSettled(requests);
+    if(currentWebsiteAlert)deliverWebsiteAlert(currentWebsiteAlert);
+    updateWebsiteAlertButton();
+  }finally{button.disabled=false}
+};
+
+function renderWebsiteAlert(status){
+  const value=status.website_alert;
+  const alert=status.online===true&&status.paired===true&&value&&
+    typeof value.id==='string'&&/^[0-9a-f]{32}$/.test(value.id)&&
+    typeof value.kind==='string'&&Object.hasOwn(websiteAlertCopy,value.kind)?value:null;
+  const panel=el('websiteAlert'),image=el('websiteAlertImage'),hint=el('websiteAlertImageStatus');
+  if(currentWebsiteAlert?.id!==alert?.id){
+    desktopWebsiteAlert?.close();
+    desktopWebsiteAlert=null;
+    el('websiteAlertAnnouncement').textContent='';
+  }
+  currentWebsiteAlert=alert;
+  panel.hidden=!alert;
+  if(!alert||alert.image_ready!==true){
+    image.hidden=true;
+    image.removeAttribute('src');
+    hint.textContent=alert?'暂未取得页面截图。':'';
+  }else{
+    const source='/api/lan/website-alert/image?event='+alert.id;
+    if(image.getAttribute('src')!==source){
+      image.hidden=true;
+      hint.textContent='正在读取页面截图…';
+      image.onload=()=>{
+        if(currentWebsiteAlert?.id===alert.id&&image.getAttribute('src')===source){
+          image.hidden=false;
+          hint.textContent='';
+        }
+      };
+      image.onerror=()=>{
+        if(currentWebsiteAlert?.id===alert.id&&image.getAttribute('src')===source){
+          image.hidden=true;
+          hint.textContent='页面截图暂时不可用。';
+        }
+      };
+      image.src=source;
+    }
+  }
+  if(alert){
+    const copy=websiteAlertCopy[alert.kind];
+    if(el('websiteAlertTitle').textContent!==copy.title){
+      el('websiteAlertTitle').textContent=copy.title;
+      el('websiteAlertInstructions').textContent=copy.instructions;
+    }
+    updateWebsiteAlertButton();
+    deliverWebsiteAlert(alert);
+  }
+}
+
 function renderConnection(s){
   if(typeof s.paired==='boolean')knownPaired=s.paired;
   if(s.online){knownPaired=true;editingConnection=false;lastStatus=s}
@@ -36,6 +176,7 @@ function renderConnection(s){
   el('workbench').style.display=shown?'block':'none';
   el('workbench').inert=!online;
   el('workbench').style.opacity=online?'1':'.5';
+  renderWebsiteAlert(s);
 }
 function refresh(){
   if(refreshing)return refreshing;

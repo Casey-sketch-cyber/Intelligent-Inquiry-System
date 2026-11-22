@@ -22,6 +22,7 @@ from vmhost.bridge import BridgeError, MAX_BODY, MAX_FILE, decode, encode
 _CLOCKS = {}
 _CLOCK_LOCK = threading.Lock()
 CLOCK_CACHE_SECONDS = 60
+WEBSITE_ALERT_IMAGE_PATH = re.compile(r"/api/worker/website-alert/image\?event=([0-9a-f]{32})")
 
 
 def check_request(value, *, now=None):
@@ -239,7 +240,9 @@ def make_server(cfg, handler, journal, certfile, keyfile, host="0.0.0.0", prefer
                 if value.get("controller_id") != cfg["controller_id"]:
                     raise BridgeError("办公电脑身份不符")
                 check_request(value)
-                if value["method"] == "GET" and value["path"] == "/api/worker/status":
+                if value["method"] == "GET" and (value["path"] == "/api/worker/status"
+                                                  or WEBSITE_ALERT_IMAGE_PATH.fullmatch(value["path"])):
+                    # 截图仅保存在当前提醒的本地文件中，不进入 RPC 执行日志。
                     status, headers, body = handler("GET", value["path"], b"", "")
                 else:
                     status, headers, body = journal.execute(value, handler)

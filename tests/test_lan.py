@@ -13,6 +13,7 @@ from test_reliability import IsolatedTest
 from inquiry import isolation, qq, db
 from ui import server
 from lanhost import config, controller, worker, package
+from lanhost import alert_webhook, website_alerts
 from lanhost.transport import Journal, Remote, make_server, check_request
 from vmhost.bridge import BridgeError
 
@@ -81,6 +82,61 @@ class LanTest(IsolatedTest):
         with self.assertRaises(BridgeError):
             Remote(descriptor | {"secret": "d" * 64}).call("POST", "/api/run", b'{}')
         handler.assert_not_called()
+
+    def test_website_screenshot_is_bound_to_current_event_and_skips_rpc_journal(self):
+        event = uuid.uuid4().hex
+        screenshot = b"\xff\xd8\xfffixture\xff\xd9"
+        alerts = website_alerts.WebsiteAlerts(config.LAN_DIR / "website-alert.jpg")
+        with patch.object(website_alerts.site_capture, "inspect_browser", return_value=({"code": "login"}, "EDGE-TAB")), \
+             patch.object(website_alerts.site_capture, "capture_site", return_value=screenshot), \
+             patch.object(website_alerts.uuid, "uuid4", return_value=Mock(hex=event)), \
+             patch.object(alert_webhook, "push"):
+            alerts.poll()
+        with patch.object(worker, "WEBSITE_ALERTS", alerts):
+            remote, descriptor, journal = self.start_rpc(worker.handler(self.cfg))
+            config.save_json(config.CONNECTION, descriptor)
+            self.enterContext(patch.object(controller, "remote", return_value=remote))
+            client = controller.app.test_client()
+            status = client.get("/api/lan/status").json
+            self.assertEqual(status["website_alert"], {"id": event, "kind": "login", "image_ready": True})
+            path = f"/api/lan/website-alert/image?event={event}"
+            image = client.get(path)
+            self.assertEqual(image.data, screenshot)
+            self.assertEqual(image.content_type, "image/jpeg")
+            self.assertEqual(image.headers.get("Cache-Control"), "no-store")
+            self.assertEqual(image.headers.get("Cross-Origin-Resource-Policy"), "same-origin")
+            self.assertEqual(client.get(path, headers={"Sec-Fetch-Site": "cross-site"}).status_code, 403)
+            self.assertEqual(client.get(path + "&event=" + event).status_code, 404)
+            with self.assertRaises(BridgeError):
+                Remote(descriptor | {"secret": "d" * 64}).call("GET", f"/api/worker/website-alert/image?event={event}")
+            with journal.connect() as conn:
+                self.assertEqual(conn.execute("SELECT count(*) FROM request").fetchone()[0], 0)
+            alerts.clear()
+            self.assertIsNone(client.get("/api/lan/status").json["website_alert"])
+            self.assertEqual(client.get(path).status_code, 404)
+
+    def test_website_webhook_settings_are_write_only_and_require_same_origin(self):
+        secret = "12345678-1234-1234-1234-123456789abc"
+        url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={secret}"
+        path = "/api/lan/website-alert/settings"
+        with patch.object(alert_webhook, "PATH", self.path / "webhook.json"), \
+             patch.object(alert_webhook, "push") as notify:
+            remote, descriptor, journal = self.start_rpc(worker.handler(self.cfg))
+            config.save_json(config.CONNECTION, descriptor)
+            self.enterContext(patch.object(controller, "remote", return_value=remote))
+            client = controller.app.test_client()
+            origin = {"Origin": "http://localhost"}
+            self.assertEqual(client.get(path).json, {"configured": False})
+            self.assertEqual(client.put(path, json={"webhook_url": url}).status_code, 403)
+            self.assertEqual(client.put(path, json={"webhook_url": url}, headers=origin).json, {"configured": True})
+            self.assertNotIn(secret, client.get(path).get_data(as_text=True))
+            invalid = client.put(path, json={"webhook_url": "https://example.test/" + secret}, headers=origin)
+            self.assertEqual(invalid.status_code, 400)
+            self.assertNotIn(secret, invalid.get_data(as_text=True))
+            self.assertEqual(client.put(path, json={"webhook_url": ""}, headers=origin).json, {"configured": False})
+            with journal.connect() as conn:
+                self.assertNotIn(secret, str(conn.execute("SELECT body FROM request").fetchall()))
+            notify.assert_not_called()
 
     def test_duplicate_request_executes_once_and_changed_payload_is_rejected(self):
         journal = Journal(self.path / "journal.db")
