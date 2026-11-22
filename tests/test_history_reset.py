@@ -79,7 +79,7 @@ class HistoryResetTests(IsolatedTest):
         before = self.counts()
         with db.connect() as c:
             c.execute("CREATE TRIGGER refuse_task_delete BEFORE DELETE ON task BEGIN SELECT RAISE(ABORT,'blocked'); END")
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(db.sqlite3.IntegrityError):
             reset_history.clear_history(self.root)
         self.assertEqual(self.counts(), before)
         self.assertTrue((self.data / "reports/old.xlsx").is_file())
