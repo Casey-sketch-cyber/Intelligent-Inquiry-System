@@ -98,7 +98,7 @@ class SavedQQLinkTests(unittest.TestCase):
         context = Mock(pages=[page])
         with patch.object(icnet, "search") as search:
             self.assertIsNone(icnet.find_visible_row(context, "MO", row))
-            self.assertEqual(icnet.find_visible_row(context, "MODEL", row), (page, {**row, "index": 4}))
+            self.assertEqual(icnet.find_visible_row(context, "MODEL", row), (page, {**row, "index": 4, "page": 1}))
             other_first = {**row, "qqs": [{"uin": "98765"}, *row["qqs"]]}
             self.assertIsNone(icnet.find_visible_row(context, "MODEL", other_first, selected_only=True))
             with self.assertRaises(icnet.SearchCancelled):

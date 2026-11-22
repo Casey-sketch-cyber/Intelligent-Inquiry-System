@@ -32,7 +32,7 @@ import win32gui  # noqa: E402
 import win32process  # noqa: E402
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory  # noqa: E402
 
-from inquiry import browser, db, incidents, report, workbench, analysis, observer  # noqa: E402
+from inquiry import browser, db, icnet, incidents, report, workbench, analysis, observer  # noqa: E402
 from inquiry.qq import exe_of  # noqa: E402
 from inquiry.runner import render_message  # noqa: E402
 from inquiry.settings import DATA_DIR  # noqa: E402
@@ -84,6 +84,7 @@ SETTINGS_SCHEMA = [
     ("filter", "require_enough_stock", bool, "库存数量够需求的供应商优先"),
     ("filter", "only_today", bool, "只询价当天更新过库存的供应商"),
     ("filter", "max_pages", int, "最多翻几页搜索结果"),
+    ("filter", "search_cache_hours", float, "搜索结果缓存时长（小时，填 0 关闭）"),
     ("llm", "model", str, "解析回复用的 DeepSeek 模型"),
     ("desktop", "foreground_assist", bool, "允许在 QQ 已在前台时使用鼠标键盘；切到其他软件立即暂停，不抢回窗口"),
 ]
@@ -482,6 +483,9 @@ def start_run():
     if run_state()["running"]:
         return jsonify(error="已经有询价程序在运行"), 409
     body = request.get_json(force=True)
+    refresh_search = body.get("refresh_search", False)
+    if type(refresh_search) is not bool:
+        raise ValueError("刷新搜索开关无效")
     parts = [f"{part}:{qty}" for part, qty in workbench.validate_parts(body.get("parts", []))]
     template = str(body.get("template") or load_settings().get("inquiry", {}).get("template", ""))
     workbench.validate_template(template)
@@ -491,6 +495,8 @@ def start_run():
         args.append("--foreground-assist")
     if body.get("dry_run"):
         args.append("--dry-run")
+    if refresh_search:
+        args.append("--refresh-search")
     if body.get("max"):
         cap = int(body["max"])
         if not 1 <= cap <= 100:
@@ -608,6 +614,7 @@ def get_settings():
     s.setdefault("inquiry", {})
     s["inquiry"].setdefault("send_card", False)
     s.setdefault("desktop", {}).setdefault("foreground_assist", False)
+    s.setdefault("filter", {}).setdefault("search_cache_hours", icnet.DEFAULT_SEARCH_CACHE_HOURS)
     preview = ""
     try:
         preview = render_message(s["inquiry"].get("template", ""), "STM32F405RGT6", 5000)

@@ -46,7 +46,7 @@ class SupplierQQLinkTests(IsolatedTest):
             conn.execute("ALTER TABLE supplier DROP COLUMN qq_launch_json")
             conn.execute("PRAGMA user_version=5")
         with db.connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
         self.assertEqual(db.task_quotes(self.task.id)[0]["row"], old)
         self.assertEqual(db.supplier(sid)["qq_uin"], "12345")
         self.assertIsNone(db.saved_qq_link(self.task.id, old["company"], "12345"))

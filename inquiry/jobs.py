@@ -20,12 +20,18 @@ def submit(body, settings):
         raise ValueError("每个型号最多询价家数须为 1–100")
     if type(body.get("dry_run", False)) is not bool:
         raise ValueError("试运行开关无效")
-    request = {"parts": parts, "template": template, "max": cap, "dry_run": body.get("dry_run", False)}
+    refresh_search = body.get("refresh_search", False)
+    if type(refresh_search) is not bool:
+        raise ValueError("刷新搜索开关无效")
+    request = {"parts": parts, "template": template, "max": cap, "dry_run": body.get("dry_run", False),
+               "refresh_search": refresh_search}
     with db.connect() as c:
         c.execute("BEGIN IMMEDIATE")
         old = c.execute("SELECT * FROM inquiry_job WHERE id=?", (jid,)).fetchone()
         if old:
-            if json.loads(old["payload"])["request"] != json.loads(json.dumps(request)):
+            old_request = json.loads(old["payload"])["request"]
+            old_request.setdefault("refresh_search", False)
+            if old_request != json.loads(json.dumps(request)):
                 raise ValueError("同一任务标识不能提交不同内容")
         else:
             payload = {"request": request, "settings": settings}
@@ -144,7 +150,8 @@ def execute(jid):
             c.execute("UPDATE inquiry_job SET status='running',started_at=?,error=NULL WHERE id=?", (time.time(), jid))
             records = [dict(r) for r in c.execute("SELECT * FROM task WHERE batch_id=? ORDER BY id", (jid,))]
             c.execute("UPDATE task SET status='running',finished_at=NULL WHERE batch_id=? AND status NOT IN ('done','dry-run')", (jid,))
-        runner = Runner([], dry_run=req["dry_run"], message=req["template"], max_suppliers=req["max"])
+        runner = Runner([], dry_run=req["dry_run"], message=req["template"], max_suppliers=req["max"],
+                        refresh_search=req.get("refresh_search", False))
         runner.cfg = dict(payload["settings"].get("inquiry", {}), max_suppliers=req["max"])
         runner.pacing = payload["settings"].get("pacing", {})
         runner.filter = payload["settings"].get("filter", {})

@@ -4,8 +4,9 @@ import json
 import random
 import re
 import time
+from collections import OrderedDict
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 
@@ -13,6 +14,7 @@ from . import incidents, search_pacing
 from .settings import DATA_DIR
 
 SEARCH_URL = "https://www.ic.net.cn/search/{part}.html"
+DEFAULT_SEARCH_CACHE_HOURS = 4
 EXTRACT_JS = (Path(__file__).parent / "extract_rows.js").read_text(encoding="utf-8")
 QQ_LINK_HOSTS = {"wpa.qq.com", "wpa1.qq.com"}
 QQ_JUMP_HOSTS = QQ_LINK_HOSTS | {"qidian.qq.com", "admin.qidian.qq.com"}
@@ -54,12 +56,17 @@ def _result_part(url: str) -> str | None:
     return None
 
 
+def _result_page_no(url: str) -> int:
+    values = parse_qs(urlsplit(url).query, keep_blank_values=True).get("page", ["1"])
+    return int(values[0]) if len(values) == 1 and re.fullmatch(r"[1-9][0-9]{0,8}", values[0]) else 0
+
+
 class SearchTabs:
-    """记录当前批次打开的搜索页，保留其他标签和需要人工处理的页面。"""
+    """最多保留两张本批次的结果页，人工标签和登录校验页不受影响。"""
 
     def __init__(self, context: BrowserContext):
         self.context = context
-        self._opened = {}
+        self._opened = OrderedDict()
 
     @property
     def pages(self):
@@ -69,40 +76,53 @@ class SearchTabs:
     def _is_owned_result(page: Page, part: str) -> bool:
         return not page.is_closed() and (page.url == "about:blank" or _result_part(page.url) == part)
 
-    def existing(self, part_no: str) -> Page | None:
+    def results(self, part_no: str, preferred: int) -> list[Page]:
         part = part_no.strip().upper()
-        page = self._opened.get(part)
-        return page if page is not None and self._is_owned_result(page, part) else None
+        pages = [page for key, page in reversed(self._opened.items()) if key[0] == part
+                 and self._is_owned_result(page, part) and _result_part(page.url) == part]
+        return sorted(pages, key=lambda page: _result_page_no(page.url) != preferred)
 
-    def open(self, part_no: str) -> Page:
+    def mark_used(self, page: Page) -> None:
+        key = next((key for key, candidate in self._opened.items() if candidate is page), None)
+        if key is not None:
+            self._opened.move_to_end(key)
+
+    def open(self, part_no: str, page_no: int = 1) -> Page:
         part = part_no.strip().upper()
-        page = self.existing(part)
-        if page is None:
-            page = self.context.new_page()
-            self._opened[part] = page
+        key = (part, page_no)
+        for old, page in tuple(self._opened.items()):
+            if not self._is_owned_result(page, old[0]):
+                self._opened.pop(old)
+        if key in self._opened:
+            self._opened.move_to_end(key)
+            return self._opened[key]
+        if len(self._opened) >= 2:
+            _, oldest = self._opened.popitem(last=False)
+            close_quietly(oldest)
+        self._opened[key] = page = self.context.new_page()
         return page
 
     def close(self, part_no: str) -> None:
         part = part_no.strip().upper()
-        page = self._opened.pop(part, None)
-        if page is not None and self._is_owned_result(page, part):
-            close_quietly(page)
+        for key in tuple(self._opened):
+            if key[0] == part:
+                page = self._opened.pop(key)
+                if self._is_owned_result(page, part):
+                    close_quietly(page)
 
     def close_all(self) -> None:
-        for part in tuple(self._opened):
+        for part in {key[0] for key in self._opened}:
             self.close(part)
 
 
 def _existing_search_page(context: BrowserContext | SearchTabs, part_no: str) -> Page | None:
-    if isinstance(context, SearchTabs):
-        return context.existing(part_no)
     part = part_no.strip().upper()
     return next((page for page in context.pages if _result_part(page.url) == part), None)
 
 
-def search_page(context: BrowserContext | SearchTabs, part_no: str) -> Page:
+def search_page(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1) -> Page:
     if isinstance(context, SearchTabs):
-        return context.open(part_no)
+        return context.open(part_no, page_no)
     return _existing_search_page(context, part_no) or context.new_page()
 
 
@@ -110,6 +130,16 @@ def _require_no_captcha(context: BrowserContext | SearchTabs) -> None:
     if any(urlparse(p.url).path == "/searchPnCode.php" for p in context.pages):
         incidents.record("captcha", "search", severity="warning")
         raise NotLoggedIn("IC交易网仍在等待网站校验，请人工完成后继续；没有重新发送搜索请求")
+
+
+def check_search_session(context: BrowserContext | SearchTabs, *, cancelled=lambda: False):
+    if cancelled():
+        raise SearchCancelled("已停止等待 IC交易网搜索")
+    _require_no_captcha(context)
+    if any(urlparse(page.url).hostname == "member.ic.net.cn" and urlparse(page.url).path.startswith("/login")
+           for page in context.pages):
+        incidents.record("login_required", "search", severity="warning")
+        raise NotLoggedIn("IC交易网仍有登录页，请在专用浏览器完成登录后继续")
 
 
 def search(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1, *,
@@ -120,10 +150,10 @@ def search(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1,
         _require_no_captcha(context)
 
     check()
-    page = search_page(context, part_no)
-    url = SEARCH_URL.format(part=quote(part_no.strip())) + (f"?page={int(page_no)}" if page_no > 1 else "")
+    url = SEARCH_URL.format(part=quote(part_no.strip(), safe="")) + (f"?page={int(page_no)}" if page_no > 1 else "")
     search_pacing.wait_for_search(part_no, page_no, source, check, wait=wait)
     check()
+    page = search_page(context, part_no, page_no)
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     if "member.ic.net.cn/login" in page.url:
         incidents.record("login_required", "search", severity="warning")
@@ -131,6 +161,8 @@ def search(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1,
     if urlparse(page.url).path == "/searchPnCode.php":
         incidents.record("captcha", "search", severity="warning")
         raise NotLoggedIn("IC交易网要求人工检查，请在专用浏览器完成网站校验后继续；未自动重试搜索")
+    if _result_part(page.url) != part_no.strip().upper() or _result_page_no(page.url) != page_no:
+        raise RuntimeError("IC交易网返回的型号或页码与请求不一致")
     page.wait_for_selector("#resultList > li", timeout=30000)
     time.sleep(1)  # 等脚本把混淆用的隐藏元素处理完
     rows = page.evaluate(EXTRACT_JS)
@@ -181,26 +213,39 @@ def find_visible_row(context: BrowserContext | SearchTabs, part_no: str, row: di
     """只核对已经打开的对应型号结果，不创建页面或触发搜索。"""
     if cancelled():
         raise SearchCancelled("已停止定位 IC交易网供应商")
-    page = _existing_search_page(context, part_no)
-    if page is not None and _result_part(page.url) == part_no.strip().upper():
-        expected = {**row, "qqs": row["qqs"][:1]} if selected_only else row
+    part, first = part_no.strip().upper(), int(row.get("page", 1))
+    if isinstance(context, SearchTabs):
+        pages = context.results(part, first)
+    else:
+        pages = [page for page in context.pages if _result_part(page.url) == part]
+    expected = {**row, "qqs": row["qqs"][:1]} if selected_only else row
+    for page in pages:
         hit = next((r for r in page.evaluate(EXTRACT_JS) if _same_supplier(r, expected)), None)
         if hit:
-            return page, {**row, "index": hit["index"]}
+            if isinstance(context, SearchTabs):
+                context.mark_used(page)
+            return page, _located_row(row, hit, _result_page_no(page.url))
     return None
+
+
+def _located_row(row: dict, hit: dict, page_no: int) -> dict:
+    selected = next((entry for entry in hit["qqs"] if entry["uin"] == row["qqs"][0]["uin"]), row["qqs"][0])
+    return {**row, "index": hit["index"], "page": page_no, "qqs": [selected, *row["qqs"][1:]]}
 
 
 def find_row(context: BrowserContext | SearchTabs, part_no: str, row: dict, max_pages: int = 3, *,
              cancelled=lambda: False, source="supplier_lookup", wait=True) -> tuple[Page, dict] | None:
     """在当前型号的搜索结果中核对供应商行，找不到时按限速翻页。"""
-    if match := find_visible_row(context, part_no, row, cancelled=cancelled):
+    check_search_session(context, cancelled=cancelled)
+    if match := find_visible_row(context, part_no, row, cancelled=cancelled, selected_only=True):
         return match
     first = int(row.get("page", 1))
+    expected = {**row, "qqs": row["qqs"][:1]}
     for p in [first] + [p for p in range(1, max_pages + 1) if p != first]:
         page, rows = search(context, part_no, p, cancelled=cancelled, source=source, wait=wait)
-        hit = next((r for r in rows if _same_supplier(r, row)), None)
+        hit = next((r for r in rows if _same_supplier(r, expected)), None)
         if hit:
-            return page, {**row, "index": hit["index"], "page": p}
+            return page, _located_row(row, hit, p)
     return None
 
 
@@ -236,10 +281,7 @@ def launch_saved_qq(context: BrowserContext | SearchTabs, qq_entry: dict, timeou
     url = direct_qq_url(qq_entry)
     if url is None:
         raise QQLaunchFailed("保存的 QQ 链接不符合直开格式")
-    _require_no_captcha(context)
-    if any(urlparse(page.url).hostname == "member.ic.net.cn" and urlparse(page.url).path.startswith("/login")
-           for page in context.pages):
-        raise NotLoggedIn("IC交易网仍有登录页，请在专用浏览器完成登录后继续")
+    check_search_session(context)
     raw_context = context.context if isinstance(context, SearchTabs) else context
     jump = raw_context.new_page()
     try:

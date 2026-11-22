@@ -59,6 +59,7 @@ def main():
     ap.add_argument("parts", nargs="*", help="型号:数量")
     ap.add_argument("--file", help="型号清单 Excel")
     ap.add_argument("--dry-run", action="store_true", help="只搜索并列出供应商，不发消息")
+    ap.add_argument("--refresh-search", action="store_true", help="本次重新搜索，跳过已有缓存")
     ap.add_argument("--only", help="只询价公司名包含该关键字的供应商")
     ap.add_argument("--message", help="本次使用的询价话术，可用 {part} {qty}")
     ap.add_argument("--max", type=int, help="本次每个型号最多询价几家（覆盖 settings.toml 的 max_suppliers）")
@@ -105,7 +106,7 @@ def main():
     if parts:
         log("开始询价：" + "，".join(f"{p}×{q}" for p, q in parts) + ("（试运行）" if args.dry_run else ""))
     Runner(parts, dry_run=args.dry_run, only=args.only, message=args.message, resume=args.resume,
-           max_suppliers=args.max).run()
+           max_suppliers=args.max, refresh_search=args.refresh_search).run()
 
 
 if __name__ == "__main__":

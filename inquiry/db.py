@@ -85,6 +85,11 @@ CREATE TABLE IF NOT EXISTS search_attempt (
     part_no TEXT NOT NULL, page_no INTEGER NOT NULL, source TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS search_attempts_time ON search_attempt(created_at);
+CREATE TABLE IF NOT EXISTS search_cache (
+    part_no TEXT NOT NULL, page_no INTEGER NOT NULL, rows_json TEXT NOT NULL,
+    ref_price REAL, fetched_at REAL NOT NULL,
+    PRIMARY KEY(part_no, page_no)
+);
 CREATE TABLE IF NOT EXISTS inquiry_job (
     id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL,
     created_at REAL NOT NULL, started_at REAL, finished_at REAL, error TEXT
@@ -101,6 +106,8 @@ CREATE INDEX IF NOT EXISTS incident_date_kind ON incident(occurred_date, kind);
 MIGRATIONS = [
     ("task", "ref_price", "REAL"),
     ("task", "batch_id", "TEXT"),
+    ("task", "search_cache_at", "REAL"),
+    ("task", "search_cache_pages", "INTEGER NOT NULL DEFAULT 0"),
     ("supplier", "inquiry_message_id", "TEXT"),
     ("supplier", "attempted_at", "REAL"),
     ("supplier", "read_error", "TEXT"),
@@ -157,12 +164,12 @@ def connect(*, timeout=30):
         conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         conn.execute("PRAGMA temp_store=MEMORY")
         _configure_journal(conn, timeout)
-        if conn.execute("PRAGMA user_version").fetchone()[0] < 6:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 7:
             conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
             for table, col, typ in MIGRATIONS:
                 if col not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
-            conn.execute("PRAGMA user_version=6")
+            conn.execute("PRAGMA user_version=7")
             conn.commit()
         yield conn
         conn.commit()
@@ -215,23 +222,70 @@ def finish_task(task_id: int, status: str = "done"):
         c.execute("UPDATE task SET status=?, finished_at=? WHERE id=?", (status, time.time(), task_id))
 
 
-def add_supplier(task_id: int, row: dict) -> int | None:
-    contacts = row.get("qqs") or []
-    selected = contacts[0] if contacts else {}
-    link = {key: selected[key] for key in ("inthref", "href") if selected.get(key)}
-    public_row = row
+def _search_row_without_links(row: dict) -> dict:
+    contacts = row.get("qqs")
     if contacts:
-        public_row = {
+        return {
             **row,
             "qqs": [{key: value for key, value in entry.items() if key not in ("inthref", "href")} for entry in contacts],
         }
+    return row
+
+
+def read_search_cache(part_no: str, page_no: int, *, cutoff: float, now: float) -> tuple[list[dict], float | None, float] | None:
+    with connect() as c:
+        row = c.execute(
+            "SELECT rows_json, ref_price, fetched_at FROM search_cache WHERE part_no=? AND page_no=? "
+            "AND fetched_at>? AND fetched_at<=?", (part_no, page_no, cutoff, now),
+        ).fetchone()
+    if row:
+        try:
+            rows = json.loads(row["rows_json"])
+        except ValueError:
+            return None
+        if isinstance(rows, list) and all(isinstance(item, dict) for item in rows):
+            return rows, row["ref_price"], row["fetched_at"]
+    return None
+
+
+def save_search_cache(part_no: str, page_no: int, rows: list[dict], price: float | None, fetched_at: float):
+    content = json.dumps([_search_row_without_links(row) for row in rows], ensure_ascii=False)
+    with connect() as c:
+        c.execute(
+            "INSERT INTO search_cache(part_no, page_no, rows_json, ref_price, fetched_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(part_no, page_no) DO UPDATE SET rows_json=excluded.rows_json, "
+            "ref_price=excluded.ref_price, fetched_at=excluded.fetched_at",
+            (part_no, page_no, content, price, fetched_at),
+        )
+
+
+def set_search_cache_usage(task_id: int, fetched_at: float | None, count: int):
+    with connect() as c:
+        c.execute("UPDATE task SET search_cache_at=?, search_cache_pages=? WHERE id=?", (fetched_at, count, task_id))
+
+
+def _qq_link_json(selected: dict) -> str | None:
+    link = {key: selected[key] for key in ("inthref", "href") if selected.get(key)}
+    return json.dumps(link, ensure_ascii=False) if link else None
+
+
+def add_supplier(task_id: int, row: dict) -> int | None:
+    selected = (row.get("qqs") or [{}])[0]
+    public_row = _search_row_without_links(row)
     with connect() as c:
         cur = c.execute(
             "INSERT OR IGNORE INTO supplier(task_id, company, company_url, row_json, qq_uin, qq_launch_json) VALUES (?,?,?,?,?,?)",
             (task_id, row["company"], row.get("companyUrl"), json.dumps(public_row, ensure_ascii=False),
-             selected.get("uin"), json.dumps(link, ensure_ascii=False) if link else None),
+             selected.get("uin"), _qq_link_json(selected)),
         )
         return cur.lastrowid if cur.rowcount else None
+
+
+def save_supplier_qq_link(task_id: int, company: str, selected: dict):
+    if link := _qq_link_json(selected):
+        with connect() as c:
+            c.execute("UPDATE supplier SET qq_launch_json=? WHERE task_id=? AND company=? AND qq_uin=?",
+                      (link, task_id, company, selected.get("uin")))
 
 
 def saved_qq_link(task_id: int, company: str, uin: str | None) -> dict | None:

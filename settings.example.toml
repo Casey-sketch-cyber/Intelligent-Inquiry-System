@@ -21,6 +21,8 @@ search_min_interval = 30        # 型号搜索和翻页共用的最短间隔（�
 search_max_per_10min = 10       # 任意连续十分钟内最多搜索多少次
 
 [filter]
+# 搜索结果的缓存小时数，设为 0 停用。
+search_cache_hours = 4
 require_enough_stock = true
 only_today = false
 max_pages = 3

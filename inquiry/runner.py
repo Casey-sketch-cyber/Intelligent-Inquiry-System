@@ -2,6 +2,7 @@
 import datetime
 import hashlib
 import json
+import math
 import random
 import re
 import signal
@@ -61,12 +62,14 @@ class Task:
     done: bool = False
     blocked_until: float = 0
     wave_remaining: int = 0
+    cached_pages: int = 0
+    oldest_cache_at: float | None = None
 
 
 class Runner:
     def __init__(self, parts: list[tuple[str, int]], dry_run: bool = False, only: str | None = None,
                  message: str | None = None, resume: list[int] | None = None, max_suppliers: int | None = None,
-                 collect: bool = False):
+                 collect: bool = False, refresh_search: bool = False):
         self.collect = collect  # 只把 resume 的任务回复收一遍就出报告，不监听、不发送
         self.send_only = False
         self.full_read_seconds = FULL_READ_SECONDS
@@ -78,6 +81,7 @@ class Runner:
         self.filter = SETTINGS.get("filter", {})
         self.parts = parts
         self.dry_run = dry_run
+        self.refresh_search = refresh_search
         self.only = only
         self.message = message  # 自定义话术，覆盖 settings.toml 里的模板
         self.resume = resume or []
@@ -252,6 +256,8 @@ class Runner:
             if self.stop_requested():
                 break
             self.next_search = self.tasks[index + 1] if index + 1 < len(self.tasks) else None
+            if self.next_search and workbench.part_key(self.next_search.part_no) == workbench.part_key(t.part_no):
+                self.next_search = None
             while not self.stop_requested() and not self.check_done(t):
                 if not t.candidates:
                     self.load_candidates(tabs, t)
@@ -279,14 +285,32 @@ class Runner:
             self.idle(POLL_SECONDS, poll=False)
 
     # ---------- 供应商 ----------
+    def _load_candidate_page(self, context, t, page_no, wait):
+        cache_hours = self.filter.get("search_cache_hours", icnet.DEFAULT_SEARCH_CACHE_HOURS)
+        if type(cache_hours) not in (int, float) or not math.isfinite(cache_hours) or cache_hours < 0:
+            cache_hours = icnet.DEFAULT_SEARCH_CACHE_HOURS
+        key = workbench.part_key(t.part_no)
+        now = time.time()
+        if cache_hours and not self.refresh_search:
+            hit = db.read_search_cache(key, page_no, cutoff=now - cache_hours * 3600, now=now)
+            if hit is not None:
+                icnet.check_search_session(context, cancelled=self.stop_requested)
+                return hit
+
+        prefetch = {} if wait else {"wait": False, "source": "prefetch"}
+        self.page, rows = icnet.search(context, t.part_no, page_no, cancelled=self.stop_requested, **prefetch)
+        price = icnet.ref_price(self.page) if page_no == 1 else None
+        if cache_hours:
+            db.save_search_cache(key, page_no, rows, price, time.time())
+        return rows, price, None
+
     def load_candidates(self, context, t: Task, *, wait=True) -> bool:
         max_pages = int(self.filter.get("max_pages", 3))
         if t.pages_loaded >= max_pages:
             return False
         page_no = t.pages_loaded + 1
         try:
-            prefetch = {} if wait else {"wait": False, "source": "prefetch"}
-            self.page, rows = icnet.search(context, t.part_no, page_no, cancelled=self.stop_requested, **prefetch)
+            rows, price, fetched_at = self._load_candidate_page(context, t, page_no, wait)
         except icnet.SearchCancelled:
             return False
         except (icnet.NotLoggedIn, search_pacing.SearchRateLimited):
@@ -297,7 +321,12 @@ class Runner:
             return False
         t.pages_loaded = page_no
         if t.pages_loaded == 1:
-            db.set_ref_price(t.id, icnet.ref_price(self.page))
+            db.set_ref_price(t.id, price)
+        if fetched_at is not None:
+            t.cached_pages += 1
+            t.oldest_cache_at = fetched_at if t.oldest_cache_at is None else min(t.oldest_cache_at, fetched_at)
+        if page_no == 1 or fetched_at is not None:
+            db.set_search_cache_usage(t.id, t.oldest_cache_at, t.cached_pages)
         exclude = ({s["company"] for s in db.suppliers(t.id) if s["status"] != "waiting_search"}
                    | {r["company"] for r in t.candidates}
                    | db.recently_asked(t.part_no, float(self.cfg.get("skip_recent_hours", 24))))
@@ -305,7 +334,8 @@ class Runner:
         if self.only:
             picked = [r for r in picked if self.only in r["company"]]
         t.candidates.extend(picked)
-        log(f"{t.part_no} 第 {t.pages_loaded} 页：{len(rows)} 行，可询价 {len(picked)} 家")
+        source = "（缓存）" if fetched_at is not None else ""
+        log(f"{t.part_no} 第 {t.pages_loaded} 页{source}：{len(rows)} 行，可询价 {len(picked)} 家")
         return bool(picked)
 
     def valid_count(self, t: Task) -> int:
@@ -451,6 +481,8 @@ class Runner:
         if found is None:
             raise RuntimeError("搜索结果里找不到这家供应商了（可能已下架）")
         self.page, row = found
+        if row["qqs"][0]["uin"] == uin:
+            db.save_supplier_qq_link(t.id, company, row["qqs"][0])
         return self._await_qq_launch(
             company, dedicated=dedicated,
             launch=lambda before_launch: icnet.launch_qq(self.page, row, before_launch=before_launch),
