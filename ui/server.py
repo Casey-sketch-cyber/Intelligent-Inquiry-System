@@ -87,6 +87,9 @@ SETTINGS_SCHEMA = [
     ("llm", "model", str, "解析回复用的 DeepSeek 模型"),
     ("desktop", "foreground_assist", bool, "允许在 QQ 已在前台时使用鼠标键盘；切到其他软件立即暂停，不抢回窗口"),
 ]
+FILE_ONLY_SETTINGS = [
+    ("inquiry", "direct_launch", bool, "实验性 QQ 链接直开，实机验证前保持关闭"),
+]
 
 
 # ---------- 工具 ----------
@@ -98,7 +101,9 @@ def load_settings() -> dict:
 def save_settings(data: dict) -> None:
     lines = ["# 天芯智能询价系统配置。可以在界面的「设置」里修改，也可以直接改这个文件。", ""]
     section = None
-    for sec, key, typ, desc in SETTINGS_SCHEMA:
+    file_settings = [entry for entry in FILE_ONLY_SETTINGS
+                     if type(data.get(entry[0], {}).get(entry[1])) is entry[2]]
+    for sec, key, typ, desc in file_settings + SETTINGS_SCHEMA:
         if sec != section:
             if section is not None:
                 lines.append("")

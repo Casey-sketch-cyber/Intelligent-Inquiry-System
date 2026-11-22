@@ -407,12 +407,11 @@ class Runner:
         return False
 
     def open_chat(self, t: Task, row: dict) -> str:
-        """在网页上点这家供应商的 QQ 头像，等 QQ 打开对应会话，返回会话名。失败抛异常。"""
+        """从 IC交易网定位这家供应商并打开 QQ 会话。失败抛异常。"""
         company = row["company"]
-        jump = None
-        name = None
         # 已建立的绑定可直接复用，省去每次网页跳转。发送时仍重新核对公司。
-        uin = row.get("qqs", [{}])[0].get("uin")
+        contacts = row.get("qqs") or [{}]
+        uin = contacts[0].get("uin")
         with db.connect() as c:
             known_chat = c.execute("SELECT chat_name FROM supplier WHERE company=? AND qq_uin=? AND sent_at IS NOT NULL AND chat_name IS NOT NULL ORDER BY sent_at DESC LIMIT 1",
                                    (company, uin)).fetchone()
@@ -426,18 +425,55 @@ class Runner:
         elif isolation.MANUAL.is_set() or isolation.DRAINING.is_set():
             raise qq.DesktopDeferred("工作机已暂停，未打开新会话")
 
+        found = None
+        if dedicated and self.cfg.get("direct_launch") is True:
+            found = icnet.find_visible_row(self.context, t.part_no, row, cancelled=self.stop_requested,
+                                           selected_only=True)
+            if found is None:
+                link = db.saved_qq_link(t.id, company, uin)
+                if link and icnet.direct_qq_url(link):
+                    try:
+                        name = self._await_qq_launch(
+                            company, dedicated=dedicated, direct=True,
+                            launch=lambda before_launch: icnet.launch_saved_qq(
+                                self.context, link, timeout=8, before_launch=before_launch),
+                        )
+                    except icnet.QQLaunchFailed:
+                        if self.stop_requested():
+                            raise qq.DesktopDeferred("工作机已暂停，未重新定位供应商")
+                    else:
+                        qq.verify_supplier(self.win, company, name, cancelled=self.stop_requested)
+                        return name
+
+        if found is None:
+            found = icnet.find_row(self.context, t.part_no, row, int(self.filter.get("max_pages", 3)),
+                                   cancelled=self.stop_requested)
+        if found is None:
+            raise RuntimeError("搜索结果里找不到这家供应商了（可能已下架）")
+        self.page, row = found
+        return self._await_qq_launch(
+            company, dedicated=dedicated,
+            launch=lambda before_launch: icnet.launch_qq(self.page, row, before_launch=before_launch),
+        )
+
+    def _await_qq_launch(self, company: str, *, launch, dedicated: bool, direct: bool = False) -> str:
+        jump = None
+        name = None
+        before = None
+
         def check_refusal():
             if message := icnet.qq_launch_error(jump):
                 raise icnet.TemporarySessionRefused(message)
 
-        found = icnet.find_row(self.context, t.part_no, row, int(self.filter.get("max_pages", 3)),
-                               cancelled=self.stop_requested)
-        if found is None:
-            raise RuntimeError("搜索结果里找不到这家供应商了（可能已下架）")
-        self.page, row = found
+        def before_launch():
+            if not dedicated:
+                qq.require_assisted_foreground(self.win)
+            elif direct and self.stop_requested():
+                raise qq.DesktopDeferred("工作机已暂停，未打开 QQ 会话")
+
         try:
             before = qq.current_chat_name(self.win)
-            jump = icnet.launch_qq(self.page, row, before_launch=(lambda: None) if dedicated else lambda: qq.require_assisted_foreground(self.win))
+            jump = launch(before_launch)
             origin = icnet.settle_origin(jump)
             if dedicated:
                 from lanhost.support import confirm_qq_dialog
@@ -447,11 +483,16 @@ class Runner:
             if not known:
                 log(f"  如果浏览器弹出“打开QQ”的确认框（来自 {origin}）：请先勾选“始终允许”，再点“打开”")
             t0 = time.time()
-            name = qq.wait_chat_change(self.win, before, timeout=20 if known else 90, cancelled=self.stop_requested,
+            timeout = 8 if direct else (20 if known else 90)
+            name = qq.wait_chat_change(self.win, before, timeout=timeout, cancelled=self.stop_requested,
                                        launch_error=check_refusal)
         except (qq.DesktopDeferred, icnet.SearchCancelled, icnet.NotLoggedIn, icnet.TemporarySessionRefused):
             raise
         except Exception as exc:
+            if direct:
+                if qq.current_chat_name(self.win) != before:
+                    raise SupplierIdentityError("直开时 QQ 会话发生变化，未能核对身份，请人工检查") from None
+                raise icnet.QQLaunchFailed("保存的 QQ 链接打开失败，将重新定位供应商") from None
             raise icnet.QQLaunchFailed(str(exc)) from exc
         else:
             # 几秒内自动打开说明浏览器已"始终允许"这个来源；要等人点确认框的不算
@@ -465,6 +506,10 @@ class Runner:
                 icnet.close_quietly(jump)
         if name is None:
             cur = qq.current_chat_name(self.win)
+            if direct:
+                if cur != before:
+                    raise SupplierIdentityError("直开时 QQ 会话发生变化，未能核对身份，请人工检查")
+                raise icnet.QQLaunchFailed("保存的 QQ 链接未打开新会话，将重新定位供应商")
             if cur and name_matches(company, cur, qq.profile_company(self.win)):
                 return cur  # 本来就停在这个会话上
             raise icnet.QQLaunchFailed("QQ 没有打开新的会话（对方可能不支持临时会话，或 QQ 弹出了其他窗口）")

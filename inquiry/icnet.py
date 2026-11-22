@@ -5,7 +5,7 @@ import random
 import re
 import time
 from pathlib import Path
-from urllib.parse import quote, urlparse, unquote
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 
@@ -14,6 +14,8 @@ from .settings import DATA_DIR
 
 SEARCH_URL = "https://www.ic.net.cn/search/{part}.html"
 EXTRACT_JS = (Path(__file__).parent / "extract_rows.js").read_text(encoding="utf-8")
+QQ_LINK_HOSTS = {"wpa.qq.com", "wpa1.qq.com"}
+QQ_JUMP_HOSTS = QQ_LINK_HOSTS | {"qidian.qq.com", "admin.qidian.qq.com"}
 
 
 class NotLoggedIn(RuntimeError):
@@ -104,14 +106,18 @@ def search_page(context: BrowserContext | SearchTabs, part_no: str) -> Page:
     return _existing_search_page(context, part_no) or context.new_page()
 
 
+def _require_no_captcha(context: BrowserContext | SearchTabs) -> None:
+    if any(urlparse(p.url).path == "/searchPnCode.php" for p in context.pages):
+        incidents.record("captcha", "search", severity="warning")
+        raise NotLoggedIn("IC交易网仍在等待网站校验，请人工完成后继续；没有重新发送搜索请求")
+
+
 def search(context: BrowserContext | SearchTabs, part_no: str, page_no: int = 1, *,
            cancelled=lambda: False, source="candidates", wait=True) -> tuple[Page, list[dict]]:
     def check():
         if cancelled():
             raise SearchCancelled("已停止等待 IC交易网搜索")
-        if any(urlparse(p.url).path == "/searchPnCode.php" for p in context.pages):
-            incidents.record("captcha", "search", severity="warning")
-            raise NotLoggedIn("IC交易网仍在等待网站校验，请人工完成后继续；没有重新发送搜索请求")
+        _require_no_captcha(context)
 
     check()
     page = search_page(context, part_no)
@@ -170,16 +176,25 @@ def _same_supplier(a: dict, b: dict) -> bool:
     return a["company"] == b["company"] and bool({q["uin"] for q in a["qqs"]} & {q["uin"] for q in b["qqs"]})
 
 
-def find_row(context: BrowserContext | SearchTabs, part_no: str, row: dict, max_pages: int = 3, *,
-             cancelled=lambda: False, source="supplier_lookup", wait=True) -> tuple[Page, dict] | None:
-    """在当前型号的搜索结果中核对供应商行，找不到时按限速翻页。"""
+def find_visible_row(context: BrowserContext | SearchTabs, part_no: str, row: dict, *,
+                     cancelled=lambda: False, selected_only: bool = False) -> tuple[Page, dict] | None:
+    """只核对已经打开的对应型号结果，不创建页面或触发搜索。"""
     if cancelled():
         raise SearchCancelled("已停止定位 IC交易网供应商")
     page = _existing_search_page(context, part_no)
     if page is not None and _result_part(page.url) == part_no.strip().upper():
-        hit = next((r for r in page.evaluate(EXTRACT_JS) if _same_supplier(r, row)), None)
+        expected = {**row, "qqs": row["qqs"][:1]} if selected_only else row
+        hit = next((r for r in page.evaluate(EXTRACT_JS) if _same_supplier(r, expected)), None)
         if hit:
             return page, {**row, "index": hit["index"]}
+    return None
+
+
+def find_row(context: BrowserContext | SearchTabs, part_no: str, row: dict, max_pages: int = 3, *,
+             cancelled=lambda: False, source="supplier_lookup", wait=True) -> tuple[Page, dict] | None:
+    """在当前型号的搜索结果中核对供应商行，找不到时按限速翻页。"""
+    if match := find_visible_row(context, part_no, row, cancelled=cancelled):
+        return match
     first = int(row.get("page", 1))
     for p in [first] + [p for p in range(1, max_pages + 1) if p != first]:
         page, rows = search(context, part_no, p, cancelled=cancelled, source=source, wait=wait)
@@ -187,6 +202,71 @@ def find_row(context: BrowserContext | SearchTabs, part_no: str, row: dict, max_
         if hit:
             return page, {**row, "index": hit["index"], "page": p}
     return None
+
+
+def direct_qq_url(qq_entry: dict) -> str | None:
+    """只接受可按固定格式重建的腾讯 WPA 链接，账号必须与供应商首个 QQ 一致。"""
+    if not isinstance(qq_entry, dict):
+        return None
+    uin = qq_entry.get("uin")
+    link = qq_entry.get("inthref") or qq_entry.get("href")
+    if not isinstance(uin, str) or not re.fullmatch(r"[1-9][0-9]{4,11}", uin):
+        return None
+    if not isinstance(link, str) or len(link) > 2048 or not link.isascii() or re.search(r"[\s\x00-\x1f\x7f\\#]", link):
+        return None
+    try:
+        url = urlsplit(link)
+        values = parse_qsl(url.query, keep_blank_values=True, strict_parsing=True, max_num_fields=4)
+    except ValueError:
+        return None
+    params = dict(values)
+    host = url.netloc.lower()
+    if (url.scheme not in {"https", "http", ""} or host not in QQ_LINK_HOSTS
+            or url.path != "/msgrd" or len(params) != len(values) or params.get("uin") != uin):
+        return None
+    allowed = {"uin": uin, "v": "3", "site": "qq", "menu": "yes"}
+    if any(allowed.get(key) != value for key, value in values):
+        return None
+    return urlunsplit(("https", host, "/msgrd", urlencode(params), ""))
+
+
+def launch_saved_qq(context: BrowserContext | SearchTabs, qq_entry: dict, timeout: float = 20,
+                    before_launch=lambda: None) -> Page:
+    """在新标签页打开已核验的 WPA 链接，HTTP 页面导航限于允许的腾讯主机。"""
+    url = direct_qq_url(qq_entry)
+    if url is None:
+        raise QQLaunchFailed("保存的 QQ 链接不符合直开格式")
+    _require_no_captcha(context)
+    if any(urlparse(page.url).hostname == "member.ic.net.cn" and urlparse(page.url).path.startswith("/login")
+           for page in context.pages):
+        raise NotLoggedIn("IC交易网仍有登录页，请在专用浏览器完成登录后继续")
+    raw_context = context.context if isinstance(context, SearchTabs) else context
+    jump = raw_context.new_page()
+    try:
+        session = raw_context.new_cdp_session(jump)
+        blocked = False
+
+        def check_navigation(event):
+            nonlocal blocked
+            target = urlsplit(event["request"]["url"])
+            request = {"requestId": event["requestId"]}
+            if target.scheme == "https" and target.netloc.lower() in QQ_JUMP_HOSTS:
+                session.send("Fetch.continueRequest", request)
+            else:
+                blocked = True
+                session.send("Fetch.failRequest", {**request, "errorReason": "BlockedByClient"})
+
+        # Chromium 逐请求检查文档导航及重定向，作用域只有这个新标签页。
+        session.on("Fetch.requestPaused", check_navigation)
+        session.send("Fetch.enable", {"patterns": [{"resourceType": "Document"}]})
+        before_launch()
+        response = jump.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        if blocked or (response is not None and response.status >= 400):
+            raise QQLaunchFailed("保存的 QQ 链接无法打开有效的腾讯页面")
+        return jump
+    except BaseException:
+        close_quietly(jump)
+        raise
 
 
 def launch_qq(page: Page, row: dict, timeout: float = 20, before_launch=lambda: None) -> Page:
@@ -262,7 +342,7 @@ def close_quietly(pg: Page | None) -> None:
 def qq_launch_error(page):
     """A Tencent refusal is a terminal result, not a reason to wait or retry that supplier."""
     try:
-        if urlparse(page.url).hostname not in {"wpa.qq.com","wpa1.qq.com","qidian.qq.com","admin.qidian.qq.com"}:
+        if urlparse(page.url).hostname not in QQ_JUMP_HOSTS:
             return None
         text = page.locator("body").inner_text(timeout=600)
         if any(s in text for s in ("无法发起临时会话","不支持临时会话","对方已关闭临时会话","无法发送临时消息")):
