@@ -3,7 +3,6 @@ import argparse
 import hashlib
 import json
 import shutil
-import sqlite3
 import tomllib
 import zipfile
 from pathlib import Path
@@ -39,10 +38,8 @@ def build(with_data=False):
                 shutil.copy2(ROOT / name, seed / name)
         dbpath = DATA_DIR / "inquiry.db"
         if dbpath.is_file():
-            target = seed / "inquiry.db"
-            target.unlink(missing_ok=True)
-            with sqlite3.connect(dbpath.as_uri() + "?mode=ro", uri=True) as src, sqlite3.connect(target) as dst:
-                src.backup(dst)
+            from inquiry.db import snapshot
+            snapshot(dbpath, seed / "inquiry.db")
         settings = tomllib.loads((ROOT / "settings.toml").read_text(encoding="utf-8"))
         card = settings.get("inquiry", {}).get("card_image", "")
         if card:

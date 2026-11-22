@@ -7,3 +7,4 @@ openpyxl
 pillow
 flask
 cryptography
+pysqlite3==0.6.2
