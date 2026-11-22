@@ -88,7 +88,7 @@ class SearchPacingTests(IsolatedTest):
         with patch.object(search_pacing, "time", self.clock):
             icnet.search(self.context, "AFTER-RESTART")
         with db.connect() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 7)
             self.assertEqual(conn.execute("SELECT part_no FROM task WHERE id=?", (task_id,)).fetchone()[0], "EXISTING")
         self.assertEqual([at for at, _ in self.visits], [10_000, 10_600])
 

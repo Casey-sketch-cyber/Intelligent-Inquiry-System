@@ -9,6 +9,7 @@ from . import db, incidents
 
 
 def part_key(value):
+    """统一型号的大小写和空白，保留连字符、斜杠等型号字符。"""
     return "".join(str(value).upper().split())
 
 

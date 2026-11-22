@@ -5,7 +5,7 @@ import uuid
 from unittest.mock import Mock, patch
 
 from test_reliability import IsolatedTest, message
-from inquiry import analysis, db, dispatch, llm, qq, workbench
+from inquiry import analysis, db, dispatch, jobs, llm, qq, workbench
 from inquiry.history import HistorySnapshot
 from inquiry.identity import SendUncertainError, SupplierIdentityError
 from inquiry.runner import Runner, Task, render_message
@@ -43,6 +43,27 @@ class BatchTests(IsolatedTest):
                      [{"part": "A", "qty": 1.5}], [{"part": "", "qty": 5}]):
             with self.assertRaises(ValueError):
                 workbench.validate_parts(data)
+
+    def test_duplicate_model_cannot_create_queue_or_cli_tasks(self):
+        template = "请报 {part} × {qty}"
+        parts = [(" chip-1 /a", 100), ("CHIP-1/\tA", 200)]
+        items = [{"part": part, "qty": qty} for part, qty in parts]
+        body = {"request_id": uuid.uuid4().hex, "parts": items, "template": template, "dry_run": True}
+
+        with self.assertRaisesRegex(ValueError, r"型号 CHIP-1/A 重复"):
+            jobs.submit(body, {})
+        with self.assertRaisesRegex(ValueError, r"型号 CHIP-1/A 重复"):
+            Runner(parts, message=template).make_tasks()
+
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM inquiry_job").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM task").fetchone()[0], 0)
+
+    def test_part_suffix_and_punctuation_do_not_create_duplicates(self):
+        parts = ["chip-1 /a", "chip-1 /b", "chip-1-a", "chip1/a", "chip-1-a+"]
+        self.assertEqual(workbench.validate_parts([{"part": part, "qty": 5} for part in parts]), [
+            ("CHIP-1/A", 5), ("CHIP-1/B", 5), ("CHIP-1-A", 5), ("CHIP1/A", 5), ("CHIP-1-A+", 5),
+        ])
 
     def test_hardcoded_or_wrong_template_rejected(self):
         for tpl in ("询价 STM32 × 5000", "询价 {part}", "{part.__class__} {qty}", "{part} {qty:.0f}"):

@@ -20,7 +20,8 @@ def main():
         settings = folder / "settings.toml"
         settings.write_text((runtime.ROOT / "settings.example.toml").read_text(encoding="utf-8"), encoding="utf-8")
         with patch.object(db, "DB_PATH", folder / "test.db"), patch.object(server, "SETTINGS_FILE", settings), \
-             patch.object(server, "spawn", Mock()), patch.object(server, "start_reply_worker", Mock()), \
+             patch.object(server, "STOP_FILE", folder / "stop.flag"), patch.object(server, "LOG_DIR", folder / "logs"), \
+             patch.object(server, "spawn", Mock()) as spawn, patch.object(server, "start_reply_worker", Mock()), \
              patch.object(server, "run_state", return_value={"running": False, "stopping": False}), \
              patch.object(server, "env_status", return_value={
                  "qq": {"ok": True, "text": "模拟会话"}, "browser": {"ok": True, "text": "已就绪"},
@@ -31,6 +32,7 @@ def main():
              patch.object(server.analysis, "start", Mock()):
             t1 = db.create_task("STM32F405RGT6", 5000)
             t2 = db.create_task("STM32F405RGT6", 3000)
+            db.set_search_cache_usage(t2, 1_795_000_000.0, 2)
             db.create_task("GD32F405RGT6", 2000)
             sid = db.add_supplier(t2, {"company": "示例电子有限公司", "qqs": [{"uin": "fixture-contact"}], "qty": "9600", "batch": "26+"})
             db.update_supplier(sid, status="asking", sent_at=100, chat_name="示例电子/采购对接", last_reply_at=200)
@@ -63,6 +65,10 @@ def main():
                     assert page.locator("#modelsTable tbody tr").count() == 1
                     page.screenshot(path=str(output / "models.png"), full_page=True)
                     page.locator("#modelsTable tbody tr").click()
+                    cache_summary = page.locator("#searchCacheSummary")
+                    cache_summary.wait_for()
+                    assert "使用 2 页搜索缓存 · 最早采集于" in cache_summary.inner_text()
+                    assert "搜索缓存" not in page.locator(f'a[href="#/tasks/{t1}"]').inner_text()
                     page.locator("[data-conversation]").click()
                     page.locator("[data-suggestion='0']").click()
                     assert "暂无目标价" in page.locator("#replyText").input_value()
@@ -116,7 +122,21 @@ def main():
                     assert "TEST-11" in page.locator("#msgPreview").inner_text()
                     assert "5000pcs" in page.locator("#msgPreview").inner_text()
                     assert page.locator("#dryRun").is_checked()
+                    refresh = page.get_by_role("button", name="刷新搜索", exact=True)
+                    assert refresh.get_attribute("aria-pressed") == "false"
+                    refresh.click()
+                    assert refresh.get_attribute("aria-pressed") == "true"
+                    assert page.locator("#searchRefreshPreview").is_visible()
+                    assert not any(r.url.endswith("/api/run") and r.method == "POST" for r in requests)
                     page.screenshot(path=str(output / "batch.png"), full_page=True)
+                    with page.expect_response(lambda res: res.url.endswith("/api/run")
+                                              and res.request.method == "POST") as refreshed_run:
+                        page.locator("#btnStart").click()
+                    assert refreshed_run.value.ok, refreshed_run.value.text()
+                    assert refreshed_run.value.request.post_data_json["refresh_search"] is True
+                    assert refreshed_run.value.request.post_data_json["dry_run"] is True
+                    assert "--refresh-search" in spawn.call_args.args[0]
+                    page.wait_for_url("**/#/log")
                     page.goto(base + "#/settings")
                     toggle = page.locator('[data-k="inquiry.send_card"]')
                     toggle.wait_for(state="attached")
@@ -129,10 +149,18 @@ def main():
                     page.wait_for_timeout(250)
                     assert server.load_settings()["inquiry"]["send_card"] is False
                     assert not page.locator('[data-k="desktop.foreground_assist"]').is_checked()
+                    cache_hours = page.locator('[data-k="filter.search_cache_hours"]')
+                    assert cache_hours.input_value() == "4"
+                    cache_hours.fill("0")
+                    with page.expect_response(lambda res: res.url.endswith("/api/settings")
+                                              and res.request.method == "PUT") as saved_cache_settings:
+                        page.locator("#btnSave").click()
+                    assert saved_cache_settings.value.ok
+                    assert server.load_settings()["filter"]["search_cache_hours"] == 0
                     page.screenshot(path=str(output / "settings.png"), full_page=True)
                     assert not errors, errors
                     browser.close()
-                print("UI smoke passed: model grouping/search, suggestion edit/rejection, runtime incident summaries, batch preview, card toggle.")
+                print("UI smoke passed: model grouping/search, suggestion edit/rejection, runtime incident summaries, batch preview, card toggle and cache controls.")
                 print("No real QQ sends or model calls. Screenshots:", output)
             finally:
                 httpd.shutdown()

@@ -43,7 +43,7 @@ const NAV = [
   ["#/settings", "设置", "settings"],
 ];
 
-const S = { ov: null, settings: null, parts: [{ part: "", qty: "" }], dryRun: true, maxN: "3", submitting: false, submission: null, log: { file: null, offset: -1, auto: true }, showDry: false, dashKey: "" };
+const S = { ov: null, settings: null, parts: [{ part: "", qty: "" }], dryRun: true, refreshSearch: false, maxN: "3", submitting: false, submission: null, log: { file: null, offset: -1, auto: true }, showDry: false, dashKey: "" };
 
 // ---------- 工具 ----------
 async function api(path, opts = {}) {
@@ -270,6 +270,7 @@ async function renderNew() {
         <div class="card">
           <div class="card-h"><h3>询价话术预览</h3><div class="spacer"></div><a class="small" href="#/settings">修改话术 ›</a></div>
           <div class="card-b"><div id="msgPreview" style="display:grid;gap:10px"></div>
+            <div class="small muted" id="searchRefreshPreview" style="margin-top:10px" hidden>本次将刷新网站搜索。</div>
             <div class="small muted" style="margin-top:10px">${inq.send_card && inq.card_image ? `发完这段话后会接着发送名片图片（${esc(inq.card_image)}）。` : "本次只发送文字（名片开关已关闭或未设置图片）。"}</div></div>
         </div>
       </div>
@@ -281,6 +282,10 @@ async function renderNew() {
               <div class="suffix"><input class="input" id="maxN" type="number" min="1" placeholder="默认 ${esc(inq.max_suppliers ?? 30)}" value="${esc(S.maxN)}"><span>家</span></div>
               <div class="help">${S.ov?.runtime?.dedicated_worker ? "按本次家数上限执行，发信完成后独立采集回复；默认每个型号最多联系三家。" : `先问 ${esc(inq.first_batch ?? 10)} 家，凑不够 ${esc(inq.target_quotes ?? 5)} 条有效报价再每批补 ${esc(inq.next_batch ?? 5)} 家`}</div></div>
             <label class="switch"><input type="checkbox" id="dryRun" ${S.dryRun ? "checked" : ""}><i></i><span><b>试运行</b><br><span class="small muted">只列出会询价哪些供应商，不发消息</span></span></label>
+            <div class="field">
+              <div><button class="btn" id="btnRefreshSearch" type="button" aria-pressed="${S.refreshSearch}" aria-describedby="searchRefreshHelp">${icon("refresh", 16)}刷新搜索</button></div>
+              <div class="help" id="searchRefreshHelp">开启后，本次提交将跳过缓存，按网站限速重新搜索。</div>
+            </div>
           </div>
         </div>
         <div class="card">
@@ -317,6 +322,7 @@ async function renderNew() {
   };
   $("#maxN").oninput = (e) => (S.maxN = e.target.value);
   $("#dryRun").onchange = (e) => { S.dryRun = e.target.checked; updateNewPageState(); };
+  $("#btnRefreshSearch").onclick = () => { S.refreshSearch = !S.refreshSearch; updateNewPageState(); };
   $("#btnStart").onclick = startRun;
 }
 
@@ -360,6 +366,12 @@ function renderPreview() {
 
 function updateNewPageState() {
   const ov = S.ov, list = $("#checklist"), btn = $("#btnStart");
+  const refresh = $("#btnRefreshSearch");
+  if (refresh) {
+    refresh.setAttribute("aria-pressed", String(S.refreshSearch));
+    refresh.disabled = S.submitting;
+    $("#searchRefreshPreview").hidden = !S.refreshSearch;
+  }
   if (!ov || !list || !btn) return;
   const e = ov.env;
   const item = (ok, text, hint) => `<div class="row"><span style="color:${ok ? "#22c55e" : "#ef4444"}">${icon(ok ? "check" : "x")}</span><div><div>${text}</div>${!ok && hint ? `<div class="small muted">${hint}</div>` : ""}</div></div>`;
@@ -380,8 +392,9 @@ async function startRun() {
   if (bad.length) { toast(`这些型号的数量不对：${bad.map((p) => p.part).join("、")}`, "bad"); return; }
   if (new Set(parts.map(p => p.part.toUpperCase())).size !== parts.length) { toast("型号重复，请合并后提交", "bad"); return; }
   const tip = parts.map((p) => `${p.part} × ${fmtQty(p.qty)}`).join("\n");
-  if (!S.dryRun && !confirm(`将对下面的型号真实发起 QQ 询价：\n\n${tip}\n\n确定开始吗？`)) return;
-  const payload={parts,dry_run:S.dryRun,max:S.maxN ? Number(S.maxN) : 3};
+  const refreshTip = S.refreshSearch ? "\n本次将刷新网站搜索。" : "";
+  if (!S.dryRun && !confirm(`将对下面的型号真实发起 QQ 询价：\n\n${tip}${refreshTip}\n\n确定开始吗？`)) return;
+  const payload={parts,dry_run:S.dryRun,max:S.maxN ? Number(S.maxN) : 3,refresh_search:S.refreshSearch};
   const payloadKey=JSON.stringify(payload);
   if(S.submission?.key!==payloadKey)S.submission={key:payloadKey,id:crypto.randomUUID()};
   payload.request_id=S.submission.id;
@@ -389,7 +402,8 @@ async function startRun() {
   try {
     await api("/api/run", { json: payload });
     S.submission=null;
-    toast(S.dryRun ? "试运行已提交" : "任务已交给第二台，系统会依次执行");
+    S.refreshSearch = false;
+    toast(payload.dry_run ? "试运行已提交" : "任务已交给第二台，系统会依次执行");
     await refreshOverview();
     location.hash = S.ov?.runtime?.dedicated_worker ? "#/" : "#/log";
   } catch (e) { toast(e.message, "bad"); } finally {S.submitting=false;updateNewPageState();}
@@ -423,6 +437,12 @@ async function renderLegacyTasks() {
   bindCommon();
 }
 
+function searchCacheSummary(task) {
+  return task.search_cache_pages > 0 && Number.isFinite(task.search_cache_at)
+    ? `本轮使用 ${task.search_cache_pages} 页搜索缓存 · 最早采集于 ${fmtTime(task.search_cache_at)}`
+    : "";
+}
+
 async function renderTaskDetail(id, quiet = false, model = null) {
   const view = $("#view");
   if (!quiet) { view.dataset.page = `task-${id}`; view.innerHTML = empty("正在加载…", "clock"); }
@@ -431,6 +451,7 @@ async function renderTaskDetail(id, quiet = false, model = null) {
   if (view.dataset.page !== `task-${id}`) return;
   const t = d.task, sups = d.suppliers;
   const history = d.history || [];
+  const cacheSummary = searchCacheSummary(t);
   const sent = sups.filter((s) => s.sent_at), replied = sups.filter((s) => s.replies?.length);
   const quotes = sups.filter((s) => s.valid).sort((a, b) => (a.tax_price ?? 1e9) - (b.tax_price ?? 1e9));
   const asking = sups.filter((s) => s.status === "asking");
@@ -444,7 +465,8 @@ async function renderTaskDetail(id, quiet = false, model = null) {
         <div class="row" style="gap:14px">
           <div class="env-icon" style="width:48px;height:48px">${icon("list", 24)}</div>
           <div><div style="font-size:20px;font-weight:750" class="mono">${esc(t.part_no)} <span class="muted" style="font-weight:500">× ${fmtQty(t.qty)} pcs</span></div>
-            <div class="row small text2" style="gap:8px">${taskChip(t)}<span>网站参考价 <b>${money(t.ref_price)}</b></span></div></div>
+            <div class="row small text2" style="gap:8px">${taskChip(t)}<span>网站参考价 <b>${money(t.ref_price)}</b></span></div>
+            ${cacheSummary ? `<div class="small muted" id="searchCacheSummary" style="margin-top:6px">${esc(cacheSummary)}</div>` : ""}</div>
         </div>
         <div class="row">
           <button class="btn" id="btnCollect">${icon("refresh", 16)}收集本型号回复一轮</button>
@@ -484,7 +506,10 @@ async function renderTaskDetail(id, quiet = false, model = null) {
           <td class="small text2 nowrap">${fmtTime(s.sent_at)}</td><td class="small text2 nowrap">${fmtTime(s.last_reply_at)}</td></tr>`).join("")}</tbody></table></div>`
         : empty("暂无已发送成功的供应商")}</div>
     </div>`;
-  if (history.length) view.insertAdjacentHTML("beforeend", `<div class="card mt"><div class="card-h"><h3>历史询价记录</h3></div><div class="card-b">${history.map(h => `<a class="btn btn-sm" style="margin:4px" href="#/tasks/${h.id}">#${h.id} · ${fmtQty(h.qty)} pcs · ${fmtTime(h.created_at)}</a>`).join("")}</div></div>`);
+  if (history.length) view.insertAdjacentHTML("beforeend", `<div class="card mt"><div class="card-h"><h3>历史询价记录</h3></div><div class="card-b">${history.map(h => {
+    const cache = searchCacheSummary(h);
+    return `<a class="btn btn-sm" style="margin:4px" href="#/tasks/${h.id}">#${h.id} · ${fmtQty(h.qty)} pcs · ${fmtTime(h.created_at)}${cache ? ` · ${esc(cache)}` : ""}</a>`;
+  }).join("")}</div></div>`);
   bindConversations();
   $("#btnCollect").onclick = async () => {
     try { await api("/api/collect", { json: { task_ids: t.task_ids || [t.id],request_id:crypto.randomUUID() } }); toast("已提交本型号的一轮回复收集，完成后停止"); refreshOverview(); } catch (e) { toast(e.message, "bad"); }
@@ -609,6 +634,7 @@ const FIELD_META = {
   "pacing.max_interval": ["两条询价最长间隔", "秒"],
   "pacing.max_per_hour": ["每小时最多发几条", "条"],
   "filter.max_pages": ["最多翻几页搜索结果", "页"],
+  "filter.search_cache_hours": ["搜索结果缓存时长（0 关闭）", "小时"],
   "filter.require_enough_stock": ["库存够需求数量的供应商优先"],
   "filter.only_today": ["只问当天更新过库存的供应商"],
   "llm.model": ["解析回复用的模型"],
@@ -651,7 +677,7 @@ async function renderSettings() {
       </div>
       <div class="card">
         <div class="card-h"><h3>操作方式与供应商筛选</h3></div>
-        <div class="card-b" style="display:grid;gap:14px">${sw("desktop.foreground_assist")}<p class="small muted">默认后台模式只使用 QQ 提供的无障碍接口。首次唤起新会话、图片或不支持后台的控件需要前台协助；开启后仍不会抢回焦点。其他软件可正常使用，待处理步骤保留。</p>${sw("filter.require_enough_stock")}${sw("filter.only_today")}${num("filter.max_pages")}</div>
+        <div class="card-b" style="display:grid;gap:14px">${sw("desktop.foreground_assist")}<p class="small muted">默认后台模式只使用 QQ 提供的无障碍接口。首次唤起新会话、图片或不支持后台的控件需要前台协助；开启后仍不会抢回焦点。其他软件可正常使用，待处理步骤保留。</p>${sw("filter.require_enough_stock")}${sw("filter.only_today")}${num("filter.max_pages")}${num("filter.search_cache_hours")}</div>
       </div>
       <div class="card">
         <div class="card-h"><h3>DeepSeek 解析</h3><span class="small muted">密钥写在项目文件夹的 .env 文件里</span></div>
